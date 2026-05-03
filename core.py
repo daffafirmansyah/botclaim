@@ -739,18 +739,18 @@ def attempt_withdraw(
             log(f"[{name}] pre-balance on-chain: {pre / 1e9:.9f} SOL")
 
     headers = build_headers(cfg["cookie"], referer_path="/wallet")
-    # Body shape guessed from 400 response wording — qolvex's
-    # /api/wallet/withdraw seems to expect {"address": ..., "amount": ...},
-    # NOT the camelCase walletAddress/amountSol used by claimyshare. If
-    # this still returns 400, paste the real Request Payload from browser
-    # DevTools and replace this dict verbatim.
-    body = {"address": wallet, "amount": amount}
-    # Log the outgoing body (redact wallet to last 4 chars) so when the
-    # server keeps saying "Valid Solana address and amount required" we
-    # can see exactly what we're sending vs what browser sends.
+    # Body shape CONFIRMED from live browser DevTools Payload capture:
+    #   POST /api/wallet/withdraw  {"solanaAddress": "<44-char-b58>",
+    #                               "amountSol": <float SOL>}
+    # (Not "address"/"amount" — the 400 "Valid Solana address and amount
+    # required" message is a generic validator response, not a hint at
+    # the real field names. Earlier guesses were wrong.)
+    body = {"solanaAddress": wallet, "amountSol": amount}
+    # Keep the outgoing-body log so future shape regressions are easy to
+    # spot. Wallet redacted to last 4 chars.
     log(
-        f"[{name}] POST {API_URL} body={{'address': "
-        f"'...{wallet[-4:]}', 'amount': {amount}}}"
+        f"[{name}] POST {API_URL} body={{'solanaAddress': "
+        f"'...{wallet[-4:]}', 'amountSol': {amount}}}"
     )
 
     rate_limit_retries_left = MAX_RETRIES_RATE_LIMIT
