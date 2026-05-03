@@ -69,7 +69,7 @@ HTTP_TIMEOUT_SEC = 20
 # Parallel mode: fire multiple accounts at once. Each account still walks
 # its own task list sequentially with TASK_INTER_DELAY_SEC between tasks.
 MAX_PARALLEL_WORKERS = 25
-PARALLEL_STAGGER_MS = 500
+PARALLEL_STAGGER_MS = 200
 
 # 429 / 5xx retry policy — SNIPE MODE.
 # Aligned with core.py used by withdraw.py / monitor.py: retry forever, fast,
