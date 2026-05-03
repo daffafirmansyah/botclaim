@@ -714,7 +714,10 @@ def attempt_withdraw(
             log(f"[{name}] pre-balance on-chain: {pre / 1e9:.9f} SOL")
 
     headers = build_headers(cfg["cookie"], referer_path="/wallet")
-    body = {"amountSol": amount, "walletAddress": wallet}
+    # Body shape confirmed from 400 response wording — qolvex's
+    # /api/wallet/withdraw expects {"address": <solana>, "amount": <sol>},
+    # NOT the camelCase walletAddress/amountSol used by claimyshare.
+    body = {"address": wallet, "amount": amount}
 
     rate_limit_retries_left = MAX_RETRIES_RATE_LIMIT
     server_error_retries_left = MAX_RETRIES_SERVER_ERROR
