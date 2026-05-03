@@ -119,6 +119,26 @@ COOLDOWN_MESSAGE_KEYWORDS = (
     "try again in 24",
 )
 
+# Site-wide withdraw outage detection. Distinct from 24h per-account
+# cooldown: this is a global, temporary pause (observed qolvex response:
+# 'Withdrawals are currently unavailable due to technical issues. Please
+# try again in 5–30 minutes. Your funds are safe.'). When we see this,
+# 2-second retries are actively harmful — they burn rate-limit budget and
+# spam the server during its own outage. Pause long and patient instead.
+OUTAGE_MESSAGE_KEYWORDS = (
+    "currently unavailable",
+    "technical issue",      # matches "technical issues" too
+    "temporarily unavailable",
+    "under maintenance",
+    "withdrawals are paused",
+    "withdrawals are disabled",
+)
+# Patient outage wait. Jittered across this range so 65 parallel accounts
+# in monitor.py don't all retry at the same second and re-trigger 429.
+OUTAGE_WAIT_MIN_SEC = 300   # 5 min — matches server's "5-30 minutes" advice
+OUTAGE_WAIT_MAX_SEC = 600   # 10 min upper end of jitter
+OUTAGE_MAX_RETRIES = 3      # give up after ~30 min total
+
 Logger = Callable[[str], None]
 
 
@@ -588,6 +608,33 @@ def is_cooldown_message(parsed: dict | None) -> bool:
     return any(k in msg for k in COOLDOWN_MESSAGE_KEYWORDS)
 
 
+def is_outage_message(parsed: dict | None) -> bool:
+    """True if response body looks like a site-wide withdraw pause
+    (e.g. qolvex's 'currently unavailable due to technical issues').
+    Tells us to back off for minutes, not seconds.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    msg = str(parsed.get("message") or parsed.get("error") or "").lower()
+    return any(k in msg for k in OUTAGE_MESSAGE_KEYWORDS)
+
+
+def _extract_retry_minutes(parsed: dict | None) -> int | None:
+    """Parse 'try again in N minutes' / 'N-M minutes' (also en-dash/em-dash)
+    from the response body. Returns the LOWER bound so we don't overshoot
+    if the server says 5-30 minutes.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    msg = str(parsed.get("message") or parsed.get("error") or "")
+    if not msg:
+        return None
+    m = re.search(r"(\d+)\s*(?:[-–—]\s*(\d+))?\s*minute", msg, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def _try_parse_json(resp: requests.Response) -> dict | None:
     """Return parsed JSON body, or None for non-JSON (e.g. text/plain 429)."""
     try:
@@ -755,6 +802,7 @@ def attempt_withdraw(
 
     rate_limit_retries_left = MAX_RETRIES_RATE_LIMIT
     server_error_retries_left = MAX_RETRIES_SERVER_ERROR
+    outage_retries_left = OUTAGE_MAX_RETRIES
     attempt_num = 0
 
     while True:
@@ -814,7 +862,37 @@ def attempt_withdraw(
             log(f"[{name}] [cooldown] daily cooldown message detected; not retrying.")
             return EXIT_COOLDOWN, parsed, status
 
-        # ----- 5xx server unavailable: retry -----
+        # ----- Site-wide outage: back off LONG, not the usual 2s ---------
+        # When the server explicitly says "withdrawals currently unavailable,
+        # try again in N minutes", 2-second retries are actively harmful —
+        # they burn per-cookie rate-limit budget and spam the server during
+        # its own outage. Must come BEFORE the generic 5xx branch below.
+        if is_outage_message(parsed):
+            if outage_retries_left > 0:
+                mins = _extract_retry_minutes(parsed) or 5
+                # Use at least server-suggested minutes; jitter up to
+                # OUTAGE_WAIT_MAX_SEC so 65 parallel accounts don't all
+                # retry at the same second.
+                lo = max(mins * 60, OUTAGE_WAIT_MIN_SEC)
+                hi = max(lo + 60, OUTAGE_WAIT_MAX_SEC)
+                wait = random.uniform(lo, hi)
+                outage_retries_left -= 1
+                msg = (parsed or {}).get("error") or (parsed or {}).get("message") or ""
+                log(
+                    f"[{name}] [outage] {status} server reports "
+                    f"'{str(msg)[:120]}'; sleeping {wait:.0f}s "
+                    f"(~{wait/60:.1f}m) then retry "
+                    f"({OUTAGE_MAX_RETRIES - outage_retries_left}/{OUTAGE_MAX_RETRIES})."
+                )
+                time.sleep(wait)
+                continue
+            log(
+                f"[{name}] [outage] outage retries exhausted "
+                f"({OUTAGE_MAX_RETRIES} attempts); giving up for now."
+            )
+            return EXIT_API_ERROR, parsed, status
+
+        # ----- 5xx server unavailable: retry (transient, not outage) -----
         if 500 <= status < 600:
             if server_error_retries_left > 0:
                 idx = min(attempt_num - 1, len(SERVER_ERROR_BACKOFF_SEC) - 1)
