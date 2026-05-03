@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
@@ -70,14 +71,16 @@ HTTP_TIMEOUT_SEC = 20
 MAX_PARALLEL_WORKERS = 8
 PARALLEL_STAGGER_MS = 500
 
-# 429 retry policy — applies to both GET /api/tasks and POST /api/tasks/{id}/
-# complete. More patient than core.py's snipe-mode because tasks don't race
-# the hot wallet; we'd rather wait than burn the cookie's rate-limit budget
-# on instant retries. Retry-After header (if the server sends one) is
-# respected when longer than TASK_429_WAIT_SEC.
-TASK_429_MAX_RETRIES = 3
-TASK_429_WAIT_SEC = 10
-TASK_429_WAIT_MAX_SEC = 60
+# 429 / 5xx retry policy — SNIPE MODE.
+# Aligned with core.py used by withdraw.py / monitor.py: retry forever, fast,
+# with sub-second jitter so 100 parallel workers don't all retry on the
+# exact same tick. The only thing that stops a retry loop is a non-429
+# non-5xx response (success, 4xx other than 429, or network error).
+TASK_429_MAX_RETRIES = math.inf       # infinite retries on 429
+TASK_5XX_MAX_RETRIES = math.inf       # infinite retries on 5xx (qolvex outage)
+TASK_429_WAIT_SEC = 2                 # base wait between retries
+TASK_429_WAIT_MAX_SEC = 5             # cap on server Retry-After (ignore absurd values)
+TASK_RETRY_JITTER_SEC = 1             # 0..1s jitter on top of base wait
 
 # Output file for tasks that need a real follow/like on X.
 PENDING_X_PATH = SCRIPT_DIR / "pending_x.json"
@@ -297,38 +300,57 @@ def _fmt_reward(parsed: dict | None) -> str:
 
 
 def _compute_429_wait(resp: requests.Response) -> float:
-    """Wait time for a 429 retry: max(server Retry-After, TASK_429_WAIT_SEC),
-    capped at TASK_429_WAIT_MAX_SEC, plus sub-second jitter."""
+    """Snipe-mode wait time for a 429 retry: TASK_429_WAIT_SEC (2s) capped
+    at TASK_429_WAIT_MAX_SEC (5s) plus sub-second jitter. We deliberately
+    do NOT respect server Retry-After when it's longer than our cap —
+    qolvex sometimes returns Retry-After: 60 which would burn our snipe
+    window. Better to keep hammering at 2s and let the per-cookie 3 req/60s
+    bucket refill in the background."""
     raw = resp.headers.get("retry-after", "")
     try:
         server_wait = int(raw) if raw else 0
     except ValueError:
         server_wait = 0
-    wait = max(server_wait, TASK_429_WAIT_SEC)
-    wait = min(wait, TASK_429_WAIT_MAX_SEC)
-    return wait + random.uniform(0, 1)
+    # Take the smaller of (server hint, our cap), with our base as floor.
+    wait = max(TASK_429_WAIT_SEC, min(server_wait, TASK_429_WAIT_MAX_SEC))
+    return wait + random.uniform(0, TASK_RETRY_JITTER_SEC)
 
 
 def fetch_tasks(cookie: str, log=None, label: str = "") -> list[dict]:
-    """GET /api/tasks for one account, with transparent 429 retry.
-    Raises on network error or on non-2xx that is not 429 (or on 429 after
-    all retries are exhausted)."""
+    """GET /api/tasks for one account, snipe-mode retry on 429 / 5xx.
+    Loops forever on transient failures (429 or 5xx); raises on network
+    error or non-transient 4xx (e.g. 401 expired cookie)."""
     resp = None
-    for attempt in range(TASK_429_MAX_RETRIES + 1):
+    attempt = 0
+    while True:
         resp = requests.get(
             TASKS_LIST_URL,
             headers=_tasks_list_headers(cookie),
             timeout=HTTP_TIMEOUT_SEC,
         )
-        if resp.status_code != 429 or attempt == TASK_429_MAX_RETRIES:
-            break
-        wait = _compute_429_wait(resp)
-        if log:
-            log(
-                f"{label} [retry] 429 on /api/tasks; sleep {wait:.1f}s "
-                f"then retry {attempt + 2}/{TASK_429_MAX_RETRIES + 1}."
-            )
-        time.sleep(wait)
+        # 429 — keep retrying forever
+        if resp.status_code == 429:
+            wait = _compute_429_wait(resp)
+            if log:
+                log(
+                    f"{label} [retry] 429 on /api/tasks; sleep {wait:.1f}s "
+                    f"then retry (attempt {attempt + 2}, snipe-mode)."
+                )
+            time.sleep(wait)
+            attempt += 1
+            continue
+        # 5xx server outage — keep retrying forever
+        if 500 <= resp.status_code < 600:
+            wait = TASK_429_WAIT_SEC + random.uniform(0, TASK_RETRY_JITTER_SEC)
+            if log:
+                log(
+                    f"{label} [retry] {resp.status_code} on /api/tasks; "
+                    f"sleep {wait:.1f}s then retry (attempt {attempt + 2}, snipe-mode)."
+                )
+            time.sleep(wait)
+            attempt += 1
+            continue
+        break
 
     resp.raise_for_status()
     data = resp.json()
@@ -345,9 +367,11 @@ def fetch_tasks(cookie: str, log=None, label: str = "") -> list[dict]:
 def complete_task(
     cookie: str, task_id: int | str, log=None, label: str = ""
 ) -> tuple[int, dict | None]:
-    """POST /api/tasks/{id}/complete with TASK_COMPLETE_BODY, with 429 retry."""
+    """POST /api/tasks/{id}/complete with TASK_COMPLETE_BODY, snipe-mode
+    retry on 429 / 5xx (loop forever on transient)."""
     resp = None
-    for attempt in range(TASK_429_MAX_RETRIES + 1):
+    attempt = 0
+    while True:
         try:
             resp = requests.post(
                 tasks_complete_url(task_id),
@@ -357,15 +381,30 @@ def complete_task(
             )
         except requests.RequestException as e:
             return 0, {"error": f"network: {e}"}
-        if resp.status_code != 429 or attempt == TASK_429_MAX_RETRIES:
-            break
-        wait = _compute_429_wait(resp)
-        if log:
-            log(
-                f"{label} [retry] 429 on task {task_id} complete; "
-                f"sleep {wait:.1f}s then retry {attempt + 2}/{TASK_429_MAX_RETRIES + 1}."
-            )
-        time.sleep(wait)
+        # 429 — keep retrying forever
+        if resp.status_code == 429:
+            wait = _compute_429_wait(resp)
+            if log:
+                log(
+                    f"{label} [retry] 429 on task {task_id} complete; "
+                    f"sleep {wait:.1f}s then retry (attempt {attempt + 2}, snipe-mode)."
+                )
+            time.sleep(wait)
+            attempt += 1
+            continue
+        # 5xx server outage — keep retrying forever
+        if 500 <= resp.status_code < 600:
+            wait = TASK_429_WAIT_SEC + random.uniform(0, TASK_RETRY_JITTER_SEC)
+            if log:
+                log(
+                    f"{label} [retry] {resp.status_code} on task {task_id} "
+                    f"complete; sleep {wait:.1f}s then retry "
+                    f"(attempt {attempt + 2}, snipe-mode)."
+                )
+            time.sleep(wait)
+            attempt += 1
+            continue
+        break
 
     try:
         parsed = resp.json()
