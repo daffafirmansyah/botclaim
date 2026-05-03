@@ -624,7 +624,15 @@ def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
         return None
 
     # Probe known/guessed field names in priority order. First numeric wins.
+    # `currentBalance` is the confirmed qolvex.xyz field (observed in real
+    # /api/stats/dashboard response). Others are kept as fallbacks in case
+    # the schema changes or other sites reuse this code.
+    # Observed qolvex response also exposes `totalEarned`, `tasksCompleted`,
+    # `totalReferrals`, `referralEarnings`, `availableTasks`,
+    # `tournamentPrizeSol`, `tournamentRank` — but only `currentBalance` is
+    # the spendable/withdrawable figure.
     candidate_fields = (
+        "currentBalance",
         "balanceSolTask",
         "balanceSol",
         "balance",
