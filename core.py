@@ -862,37 +862,15 @@ def attempt_withdraw(
             log(f"[{name}] [cooldown] daily cooldown message detected; not retrying.")
             return EXIT_COOLDOWN, parsed, status
 
-        # ----- Site-wide outage: back off LONG, not the usual 2s ---------
-        # When the server explicitly says "withdrawals currently unavailable,
-        # try again in N minutes", 2-second retries are actively harmful —
-        # they burn per-cookie rate-limit budget and spam the server during
-        # its own outage. Must come BEFORE the generic 5xx branch below.
-        if is_outage_message(parsed):
-            if outage_retries_left > 0:
-                mins = _extract_retry_minutes(parsed) or 5
-                # Use at least server-suggested minutes; jitter up to
-                # OUTAGE_WAIT_MAX_SEC so 65 parallel accounts don't all
-                # retry at the same second.
-                lo = max(mins * 60, OUTAGE_WAIT_MIN_SEC)
-                hi = max(lo + 60, OUTAGE_WAIT_MAX_SEC)
-                wait = random.uniform(lo, hi)
-                outage_retries_left -= 1
-                msg = (parsed or {}).get("error") or (parsed or {}).get("message") or ""
-                log(
-                    f"[{name}] [outage] {status} server reports "
-                    f"'{str(msg)[:120]}'; sleeping {wait:.0f}s "
-                    f"(~{wait/60:.1f}m) then retry "
-                    f"({OUTAGE_MAX_RETRIES - outage_retries_left}/{OUTAGE_MAX_RETRIES})."
-                )
-                time.sleep(wait)
-                continue
-            log(
-                f"[{name}] [outage] outage retries exhausted "
-                f"({OUTAGE_MAX_RETRIES} attempts); giving up for now."
-            )
-            return EXIT_API_ERROR, parsed, status
+        # NOTE: outage-detection branch (is_outage_message) was removed per
+        # user preference for pure snipe mode — when qolvex is in a global
+        # withdraw outage, we'd rather keep hammering at 2s so we catch the
+        # instant it recovers than politely wait 5-30 min and miss the
+        # topup window. The is_outage_message() / _extract_retry_minutes()
+        # helpers are retained in the module for quick re-enable if/when
+        # the trade-off changes.
 
-        # ----- 5xx server unavailable: retry (transient, not outage) -----
+        # ----- 5xx server unavailable: retry fast (2s, infinite) -----
         if 500 <= status < 600:
             if server_error_retries_left > 0:
                 idx = min(attempt_num - 1, len(SERVER_ERROR_BACKOFF_SEC) - 1)
