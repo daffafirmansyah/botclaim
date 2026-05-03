@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -67,6 +68,15 @@ HTTP_TIMEOUT_SEC = 20
 # its own task list sequentially with TASK_INTER_DELAY_SEC between tasks.
 MAX_PARALLEL_WORKERS = 8
 PARALLEL_STAGGER_MS = 500
+
+# 429 retry policy — applies to both GET /api/tasks and POST /api/tasks/{id}/
+# complete. More patient than core.py's snipe-mode because tasks don't race
+# the hot wallet; we'd rather wait than burn the cookie's rate-limit budget
+# on instant retries. Retry-After header (if the server sends one) is
+# respected when longer than TASK_429_WAIT_SEC.
+TASK_429_MAX_RETRIES = 3
+TASK_429_WAIT_SEC = 10
+TASK_429_WAIT_MAX_SEC = 60
 
 # Output file for tasks that need a real follow/like on X.
 PENDING_X_PATH = SCRIPT_DIR / "pending_x.json"
@@ -253,13 +263,40 @@ def _fmt_reward(parsed: dict | None) -> str:
     return " ".join(parts) if parts else "(no reward fields)"
 
 
-def fetch_tasks(cookie: str) -> list[dict]:
-    """GET /api/tasks for one account. Raises on network / non-200."""
-    resp = requests.get(
-        TASKS_LIST_URL,
-        headers=_tasks_list_headers(cookie),
-        timeout=HTTP_TIMEOUT_SEC,
-    )
+def _compute_429_wait(resp: requests.Response) -> float:
+    """Wait time for a 429 retry: max(server Retry-After, TASK_429_WAIT_SEC),
+    capped at TASK_429_WAIT_MAX_SEC, plus sub-second jitter."""
+    raw = resp.headers.get("retry-after", "")
+    try:
+        server_wait = int(raw) if raw else 0
+    except ValueError:
+        server_wait = 0
+    wait = max(server_wait, TASK_429_WAIT_SEC)
+    wait = min(wait, TASK_429_WAIT_MAX_SEC)
+    return wait + random.uniform(0, 1)
+
+
+def fetch_tasks(cookie: str, log=None, label: str = "") -> list[dict]:
+    """GET /api/tasks for one account, with transparent 429 retry.
+    Raises on network error or on non-2xx that is not 429 (or on 429 after
+    all retries are exhausted)."""
+    resp = None
+    for attempt in range(TASK_429_MAX_RETRIES + 1):
+        resp = requests.get(
+            TASKS_LIST_URL,
+            headers=_tasks_list_headers(cookie),
+            timeout=HTTP_TIMEOUT_SEC,
+        )
+        if resp.status_code != 429 or attempt == TASK_429_MAX_RETRIES:
+            break
+        wait = _compute_429_wait(resp)
+        if log:
+            log(
+                f"{label} [retry] 429 on /api/tasks; sleep {wait:.1f}s "
+                f"then retry {attempt + 2}/{TASK_429_MAX_RETRIES + 1}."
+            )
+        time.sleep(wait)
+
     resp.raise_for_status()
     data = resp.json()
     if isinstance(data, list):
@@ -273,18 +310,30 @@ def fetch_tasks(cookie: str) -> list[dict]:
 
 
 def complete_task(
-    cookie: str, task_id: int | str
+    cookie: str, task_id: int | str, log=None, label: str = ""
 ) -> tuple[int, dict | None]:
-    """POST /api/tasks/{id}/complete with TASK_COMPLETE_BODY."""
-    try:
-        resp = requests.post(
-            tasks_complete_url(task_id),
-            headers=_task_complete_headers(cookie, task_id),
-            json=TASK_COMPLETE_BODY,
-            timeout=HTTP_TIMEOUT_SEC,
-        )
-    except requests.RequestException as e:
-        return 0, {"error": f"network: {e}"}
+    """POST /api/tasks/{id}/complete with TASK_COMPLETE_BODY, with 429 retry."""
+    resp = None
+    for attempt in range(TASK_429_MAX_RETRIES + 1):
+        try:
+            resp = requests.post(
+                tasks_complete_url(task_id),
+                headers=_task_complete_headers(cookie, task_id),
+                json=TASK_COMPLETE_BODY,
+                timeout=HTTP_TIMEOUT_SEC,
+            )
+        except requests.RequestException as e:
+            return 0, {"error": f"network: {e}"}
+        if resp.status_code != 429 or attempt == TASK_429_MAX_RETRIES:
+            break
+        wait = _compute_429_wait(resp)
+        if log:
+            log(
+                f"{label} [retry] 429 on task {task_id} complete; "
+                f"sleep {wait:.1f}s then retry {attempt + 2}/{TASK_429_MAX_RETRIES + 1}."
+            )
+        time.sleep(wait)
+
     try:
         parsed = resp.json()
     except ValueError:
@@ -319,7 +368,7 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
 
     log(f"[{name}] fetching tasks list...")
     try:
-        tasks = fetch_tasks(cookie)
+        tasks = fetch_tasks(cookie, log=log, label=f"[{name}]")
     except Exception as e:  # noqa: BLE001
         log(f"[{name}] [error] failed to fetch tasks: {e}")
         empty_result["error"] = 1
@@ -357,7 +406,7 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
             continue
 
         log(f"[{name}] posting /api/tasks/{tid}/complete ('{title}')...")
-        status, body = complete_task(cookie, tid)
+        status, body = complete_task(cookie, tid, log=log, label=f"[{name}]")
         outcome = _classify_response(status, body)
 
         if outcome == "ok":
