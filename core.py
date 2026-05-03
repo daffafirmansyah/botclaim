@@ -100,6 +100,13 @@ RETRY_429_COOLDOWN_THRESHOLD_SEC = 3600  # Retry-After > 1h => treat as lock
 SERVER_ERROR_BACKOFF_SEC = (2, 2, 2, 2)  # flat 2s wait, no escalation
 RETRY_JITTER_SEC = 1                     # small jitter to desync workers
 
+# 429 retry for GET /api/stats/dashboard (balance fetch, not time-critical).
+# More patient than the withdraw POST retry — we'd rather wait for the
+# per-cookie rate-limit window to reset than burn all 3 budget slots in 6s.
+BALANCE_FETCH_429_MAX_RETRIES = 3
+BALANCE_FETCH_429_WAIT_SEC = 10
+BALANCE_FETCH_429_WAIT_MAX_SEC = 60
+
 # Qolvex returns 429 with Content-Type: text/plain and body "Too many requests"
 # (17 bytes). These substrings let us detect the daily-cooldown message that
 # sometimes comes back as 200-OK in a JSON body. Tune if qolvex phrases it
@@ -608,11 +615,29 @@ def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
     name = cfg.get("name", "?")
     headers = build_headers(cfg["cookie"], referer_path="/dashboard")
 
-    try:
-        resp = requests.get(USER_API_URL, headers=headers, timeout=15)
-    except requests.RequestException as e:
-        log(f"[{name}] [balance] network error: {e}")
-        return None
+    resp = None
+    for attempt in range(BALANCE_FETCH_429_MAX_RETRIES + 1):
+        try:
+            resp = requests.get(USER_API_URL, headers=headers, timeout=15)
+        except requests.RequestException as e:
+            log(f"[{name}] [balance] network error: {e}")
+            return None
+        if resp.status_code != 429 or attempt == BALANCE_FETCH_429_MAX_RETRIES:
+            break
+        # 429: respect Retry-After if present, else fall back to constant.
+        raw = resp.headers.get("retry-after", "")
+        try:
+            server_wait = int(raw) if raw else 0
+        except ValueError:
+            server_wait = 0
+        wait = max(server_wait, BALANCE_FETCH_429_WAIT_SEC)
+        wait = min(wait, BALANCE_FETCH_429_WAIT_MAX_SEC)
+        wait += random.uniform(0, RETRY_JITTER_SEC)
+        log(
+            f"[{name}] [balance] 429 on /api/stats/dashboard; sleep "
+            f"{wait:.1f}s then retry {attempt + 2}/{BALANCE_FETCH_429_MAX_RETRIES + 1}."
+        )
+        time.sleep(wait)
 
     if resp.status_code != 200:
         log(f"[{name}] [balance] unexpected status {resp.status_code}.")
