@@ -1,0 +1,17 @@
+{
+  "_comment": "Multi-account schema for qolvex.xyz. qolvex uses COOKIE-ONLY auth (no Bearer JWT), so only 'cookie' is needed per account. amount_sol is optional: set to \"auto\" (or omit it) to auto-withdraw the full claimable balance. Or hard-code a number to always withdraw exactly that. Legacy flat schema is still accepted.",
+  "accounts": [
+    {
+      "name": "acc1",
+      "cookie": "PASTE_FULL_COOKIE_HEADER_VALUE_HERE",
+      "wallet_address": "YOUR_SOLANA_WALLET_ADDRESS",
+      "amount_sol": "auto"
+    },
+    {
+      "name": "acc2",
+      "cookie": "PASTE_FULL_COOKIE_HEADER_VALUE_HERE",
+      "wallet_address": "YOUR_SOLANA_WALLET_ADDRESS",
+      "amount_sol": "auto"
+    }
+  ]
+}

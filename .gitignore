@@ -1,0 +1,12 @@
+config.json
+state.json
+accounts.tsv
+accounts.csv
+withdraw.log
+monitor.log
+tasks.log
+pending_x.json
+__pycache__/
+*.pyc
+.venv/
+venv/
