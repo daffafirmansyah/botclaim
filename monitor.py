@@ -65,12 +65,14 @@ PER_ACCOUNT_SPACING_SEC = 5
 # is detected, instead of sequential with INTER_ACCOUNT_SPACING_SEC between
 # them. Trade-off: makes the burst pattern from one IP more visible to WAF.
 PARALLEL_FIRE = True
-MAX_PARALLEL_WORKERS = 32
+MAX_PARALLEL_WORKERS = 10
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
-# before its first request fires. 2ms = effectively a burst (64 accts in
-# ~126ms) but avoids exact-same-timestamp fingerprint some WAFs flag.
-# Raise to 200/500/2000 if you see IP-level blocks (403 / connection refused).
-PARALLEL_STAGGER_MS = 2
+# before its first request fires. 500ms = moderate: first 10 accts fire in
+# ~5s (still good snipe window), rest trickle across ~50s for 100 accts.
+# Previous 2ms burst (all 32 workers in <100ms) triggered qolvex's
+# 'max 3 accounts per wallet' 403 during 2026-05-03 parallel run.
+# Raise to 1000-2000 if 403 wallet-limit still appears under load.
+PARALLEL_STAGGER_MS = 500
 
 # Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5
