@@ -96,8 +96,9 @@ ACTION_DELAY_MIN_SEC = 30
 ACTION_DELAY_MAX_SEC = 90
 
 # Delay between accounts (smaller — different sessions, less suspicious).
-ACCOUNT_DELAY_MIN_SEC = 5
-ACCOUNT_DELAY_MAX_SEC = 12
+# Bumped 5-12s -> 8-18s 2026-05-04 to match overall throttle-down pass.
+ACCOUNT_DELAY_MIN_SEC = 8
+ACCOUNT_DELAY_MAX_SEC = 18
 
 HTTP_TIMEOUT_SEC = 20
 
