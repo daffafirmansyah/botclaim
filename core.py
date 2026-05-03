@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import re
 import sys
 import threading
 import time
@@ -199,6 +200,32 @@ def _normalize_amount_sol(raw, acc_name: str):
     sys.exit(EXIT_CONFIG)
 
 
+# Matches any JSON string value for a sensitive auth key, capturing the key,
+# the value contents, and the closing quote so we can scrub embedded control
+# chars from the value. DOTALL is set by caller; [^"]* keeps us from reading
+# past the closing quote even across multiple physical lines.
+_SENSITIVE_KEY_VALUE_RE = re.compile(
+    r'("(?:cookie|bearer_token)"\s*:\s*")([^"]*)(")',
+    re.DOTALL,
+)
+
+
+def sanitize_json_text(text: str) -> str:
+    """
+    Strip literal CR / LF / TAB from inside cookie (and bearer_token) string
+    values. Browsers sometimes copy cookies with wrapped/embedded newlines
+    from DevTools; those break json.loads() because raw control chars are
+    not allowed inside JSON string literals.
+
+    This is a no-op if all values are already clean, so it's safe to call
+    unconditionally before every parse.
+    """
+    def _clean(m: re.Match) -> str:
+        return m.group(1) + re.sub(r"[\r\n\t]+", "", m.group(2)) + m.group(3)
+
+    return _SENSITIVE_KEY_VALUE_RE.sub(_clean, text)
+
+
 def _read_config_file() -> dict:
     if not CONFIG_PATH.exists():
         print(
@@ -208,9 +235,14 @@ def _read_config_file() -> dict:
         )
         sys.exit(EXIT_CONFIG)
 
+    # utf-8-sig tolerates a BOM if Notepad / PowerShell created the file.
+    raw = CONFIG_PATH.read_text(encoding="utf-8-sig")
+    # Auto-repair the most common config.json mistake: a cookie pasted from
+    # DevTools with an embedded newline. Without this, json.loads() throws
+    # "Invalid control character at: ..." and the user has to hand-edit.
+    raw = sanitize_json_text(raw)
     try:
-        # utf-8-sig tolerates a BOM if Notepad / PowerShell created the file.
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        return json.loads(raw)
     except json.JSONDecodeError as e:
         print(f"[error] config.json is not valid JSON: {e}", file=sys.stderr)
         sys.exit(EXIT_CONFIG)

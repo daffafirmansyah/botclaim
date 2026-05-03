@@ -61,8 +61,14 @@ def load_config_data() -> dict:
     if not CONFIG_PATH.exists():
         return {"accounts": []}
 
+    raw = CONFIG_PATH.read_text(encoding="utf-8-sig")
+    # Auto-repair cookie values that were pasted from DevTools with an
+    # embedded newline — those are raw control chars which json.loads()
+    # rejects. Shared helper with core.py.
+    from core import sanitize_json_text
+    raw = sanitize_json_text(raw)
     try:
-        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        data = json.loads(raw)
     except json.JSONDecodeError as e:
         sys.exit(f"[error] existing config.json is invalid JSON: {e}")
 
