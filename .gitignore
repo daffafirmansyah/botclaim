@@ -5,7 +5,10 @@ accounts.csv
 withdraw.log
 monitor.log
 tasks.log
+x_auto.log
 pending_x.json
+x_accounts.json
+x_accounts.tsv
 __pycache__/
 *.pyc
 .venv/
