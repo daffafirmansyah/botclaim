@@ -289,8 +289,12 @@ def load_accounts() -> list[dict]:
         )
         sys.exit(EXIT_CONFIG)
 
+    def _is_blank(v) -> bool:
+        return v is None or (isinstance(v, str) and not v.strip())
+
     seen_names: set[str] = set()
     normalized: list[dict] = []
+    skipped_blank: list[str] = []
     for idx, acc in enumerate(raw_accounts):
         if not isinstance(acc, dict):
             print(f"[error] accounts[{idx}] is not an object.", file=sys.stderr)
@@ -304,18 +308,37 @@ def load_accounts() -> list[dict]:
             sys.exit(EXIT_CONFIG)
         seen_names.add(name)
 
-        missing = [k for k in REQUIRED_ACCOUNT_FIELDS if not acc.get(k)]
-        if missing:
-            print(
-                f"[error] account {name!r} missing fields: {', '.join(missing)}",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_CONFIG)
+        # Gradual-fill friendly: if a required field is blank (empty string
+        # or null), silently skip the account instead of aborting. Lets the
+        # user test with a subset of filled accounts while the rest of
+        # config.json is still being populated.
+        blank = [k for k in REQUIRED_ACCOUNT_FIELDS if _is_blank(acc.get(k))]
+        if blank:
+            skipped_blank.append(name)
+            continue
 
         cleaned = dict(acc)
         cleaned["name"] = name
         cleaned["amount_sol"] = _normalize_amount_sol(acc.get("amount_sol"), name)
         normalized.append(cleaned)
+
+    if skipped_blank:
+        preview = ", ".join(skipped_blank[:5])
+        if len(skipped_blank) > 5:
+            preview += f", ... +{len(skipped_blank) - 5} more"
+        print(
+            f"[info] skipped {len(skipped_blank)} account(s) with blank "
+            f"cookie/wallet ({preview}). Fill them in config.json to enable.",
+            file=sys.stderr,
+        )
+
+    if not normalized:
+        print(
+            "[error] no usable accounts in config.json (all have blank "
+            "cookie or wallet_address). Fill in at least one account.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_CONFIG)
 
     return normalized
 
