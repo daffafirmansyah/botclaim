@@ -58,8 +58,9 @@ from core import (
 TASK_INTER_DELAY_SEC = 8
 
 # Only attempt tasks whose title starts with one of these (case-insensitive).
-# Anything else (Register, Share, Visit, etc.) is skipped silently.
-TASK_TITLE_PREFIXES = ("follow", "like", "retweet", "repost")
+# Strictly follow/like only — retweet/repost/share/register/visit etc. are
+# all skipped silently. Expand this tuple later if you want to broaden.
+TASK_TITLE_PREFIXES = ("follow", "like")
 
 # Per-request HTTP timeout.
 HTTP_TIMEOUT_SEC = 20
@@ -142,6 +143,41 @@ def _task_complete_headers(cookie: str, task_id: int | str) -> dict:
     return build_headers(cookie, referer_path=f"/tasks/{task_id}")
 
 
+# Field names that commonly indicate a task is already done. We don't know
+# which one qolvex uses, so we check all of them.
+#   *_BOOL: any of these == True means done.
+#   *_TS:   any of these being truthy (non-null, non-empty) means done
+#           (APIs often expose completedAt / claimedAt timestamps).
+#   *_STATUS_VALUES: a "status" string field equal to one of these means done.
+_DONE_BOOL_FIELDS = (
+    "completed", "done", "isCompleted", "isDone",
+    "claimed", "isClaimed", "finished", "isFinished",
+    "rewardClaimed", "reward_claimed",
+)
+_DONE_TIMESTAMP_FIELDS = (
+    "completedAt", "completed_at",
+    "claimedAt", "claimed_at",
+    "finishedAt", "finished_at",
+    "doneAt", "done_at",
+)
+_DONE_STATUS_VALUES = ("completed", "done", "claimed", "finished", "success")
+
+
+def _is_done(task: dict) -> bool:
+    """True if qolvex's response marks this task as already completed."""
+    for f in _DONE_BOOL_FIELDS:
+        if task.get(f) is True:
+            return True
+    for f in _DONE_TIMESTAMP_FIELDS:
+        # Any non-null, non-empty value here implies the action already happened.
+        if task.get(f):
+            return True
+    status = str(task.get("status") or "").strip().lower()
+    if status in _DONE_STATUS_VALUES:
+        return True
+    return False
+
+
 def _is_eligible(task: dict) -> bool:
     """True if the task is a follow/like type and not already completed."""
     # Title is the primary signal; some APIs also expose `type` or `category`.
@@ -153,12 +189,9 @@ def _is_eligible(task: dict) -> bool:
     if not (title_match or type_match):
         return False
 
-    if task.get("completed") is True:
+    if _is_done(task):
         return False
-    if task.get("done") is True:
-        return False
-    if task.get("isCompleted") is True:
-        return False
+
     return True
 
 
@@ -202,12 +235,12 @@ def _classify_response(status: int, body: dict | None) -> str:
 
 
 def _infer_action(task: dict) -> str:
-    """Return 'follow' or 'like' based on task title/type. Default 'follow'."""
+    """Return 'follow' or 'like' based on task title/type. Default 'follow'.
+    Only these two are possible because TASK_TITLE_PREFIXES filtered the
+    rest out upstream."""
     t = f"{task.get('title', '')} {task.get('type', '')}".lower()
     if "like" in t:
         return "like"
-    if "retweet" in t or "repost" in t:
-        return "retweet"
     return "follow"
 
 
@@ -378,8 +411,8 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
     other = len(tasks) - len(eligible)
     log(
         f"[{name}] {len(tasks)} task(s) total | "
-        f"{len(eligible)} eligible (follow/like/retweet) | "
-        f"{other} skipped (other types or already done)."
+        f"{len(eligible)} eligible (follow/like only) | "
+        f"{other} skipped (retweet/share/visit/register/already-done/etc)."
     )
 
     result = dict(empty_result)
