@@ -16,6 +16,7 @@ Exit code reflects the best outcome across accounts:
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -91,16 +92,36 @@ def _run_sequential(accounts: list[dict], log) -> list[int]:
     return results
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Qolvex auto-withdraw, one-shot mode.",
+    )
+    p.add_argument(
+        "--name",
+        help="run only the account with this name (default: all accounts).",
+    )
+    return p.parse_args()
+
+
 def main() -> int:
+    args = _parse_args()
     accounts = load_accounts()
     log = make_logger("withdraw.log")
 
+    if args.name:
+        match = [a for a in accounts if a.get("name") == args.name]
+        if not match:
+            print(f"[error] account {args.name!r} not found in config.json.",
+                  file=sys.stderr)
+            return EXIT_API_ERROR
+        accounts = match
+
     log(
         f"one-shot start | accounts={[a['name'] for a in accounts]} "
-        f"mode={'parallel' if PARALLEL_FIRE else 'sequential'}"
+        f"mode={'parallel' if PARALLEL_FIRE and len(accounts) > 1 else 'sequential'}"
     )
 
-    if PARALLEL_FIRE:
+    if PARALLEL_FIRE and len(accounts) > 1:
         results = _run_parallel(accounts, log)
     else:
         results = _run_sequential(accounts, log)
