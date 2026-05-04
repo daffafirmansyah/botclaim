@@ -88,6 +88,14 @@ DAILY_COOLDOWN_SEC = 23 * 3600 + 55 * 60  # 23h55m
 # smallest payout typically looks like on qolvex.
 MIN_WITHDRAW_SOL = 0.0005
 
+# Safety buffer subtracted from claimable balance in 'auto' mode. Qolvex
+# occasionally rejects exact-balance withdraws as INSUFFICIENT BALANCE due
+# to a tiny drift between the /api/stats/dashboard reading and the moment
+# the withdraw POST is processed (rewards may have been re-computed,
+# rounding rules at server differ, etc.). Leaving 0.000001 SOL on the table
+# is cheap insurance against the whole call failing. Set to 0 to disable.
+AUTO_WITHDRAW_BUFFER_SOL = 0.000001
+
 # ----- Retry policy for transient failures -----
 # AGGRESSIVE / SNIPE mode: retry 429 and 5xx as fast as possible.
 # 24h daily cooldown (server-enforced lock) is NEVER retried — retrying
@@ -774,8 +782,20 @@ def attempt_withdraw(
                 f"below threshold {MIN_WITHDRAW_SOL} SOL; nothing to withdraw."
             )
             return EXIT_COOLDOWN, None, 0
-        amount = balance
-        log(f"[{name}] [auto] claimable balance = {amount:.9f} SOL; withdrawing that.")
+        # Leave a small buffer so we don't trigger qolvex's INSUFFICIENT
+        # BALANCE error on edge-case rounding mismatches.
+        amount = balance - AUTO_WITHDRAW_BUFFER_SOL
+        if amount < MIN_WITHDRAW_SOL:
+            log(
+                f"[{name}] [skip] balance {balance:.9f} SOL minus "
+                f"buffer {AUTO_WITHDRAW_BUFFER_SOL} SOL would be "
+                f"below threshold {MIN_WITHDRAW_SOL} SOL; skipping."
+            )
+            return EXIT_COOLDOWN, None, 0
+        log(
+            f"[{name}] [auto] claimable={balance:.9f} SOL, "
+            f"withdrawing {amount:.9f} SOL (buffer {AUTO_WITHDRAW_BUFFER_SOL})."
+        )
     else:
         amount = float(raw_amount)
 
