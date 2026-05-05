@@ -39,6 +39,7 @@ from core import (
     load_accounts,
     load_state,
     make_logger,
+    priority_sort_accounts,
     save_state,
     utc_now_iso,
 )
@@ -240,6 +241,10 @@ def _process_topup(
             "before we could fire; aborting batch."
         )
         return
+
+    # Priority + balance-desc sort so hafidz fires first and the next stagger
+    # slots go to the highest-balance accounts. Adds ~3s latency at most.
+    eligible = priority_sort_accounts(eligible, log)
 
     if PARALLEL_FIRE:
         _process_topup_parallel(eligible, state, log)

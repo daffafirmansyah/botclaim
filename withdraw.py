@@ -29,6 +29,7 @@ from core import (
     attempt_withdraw,
     load_accounts,
     make_logger,
+    priority_sort_accounts,
 )
 
 # Parallel firing: send all account POSTs concurrently. Set False to fall
@@ -119,6 +120,11 @@ def main() -> int:
         f"one-shot start | accounts={[a['name'] for a in accounts]} "
         f"mode={'parallel' if PARALLEL_FIRE and len(accounts) > 1 else 'sequential'}"
     )
+
+    # Priority + balance-desc sort when running multi-account; pointless
+    # for single-account --name runs.
+    if len(accounts) > 1:
+        accounts = priority_sort_accounts(accounts, log)
 
     if PARALLEL_FIRE and len(accounts) > 1:
         results = _run_parallel(accounts, log)

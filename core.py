@@ -19,6 +19,7 @@ import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -100,6 +101,11 @@ RATE_LIMIT_MAX_REQS = 3
 # already drained in the current cycle. Adjust after checking what the
 # smallest payout typically looks like on qolvex.
 MIN_WITHDRAW_SOL = 0.0005
+
+# Account that always fires first regardless of balance. Set to '' to
+# disable priority pinning. Used by priority_sort_accounts() below, called
+# from monitor.py and withdraw.py just before parallel dispatch.
+PRIORITY_ACCOUNT_NAME = "hafidz"
 
 # Safety buffer subtracted from claimable balance in 'auto' mode. Qolvex
 # occasionally rejects exact-balance withdraws as INSUFFICIENT BALANCE due
@@ -607,6 +613,98 @@ def _try_parse_json(resp: requests.Response) -> dict | None:
     # Some error payloads are plain strings or arrays; wrap into a dict so the
     # rest of the pipeline can still read .get("message") safely.
     return {"raw": parsed}
+
+
+def _quick_balance(acc: dict, timeout: float = 3.0) -> float:
+    """One-shot balance fetch, NO retries. Returns -1.0 on any failure.
+
+    Used only by priority_sort_accounts() pre-fire — we want fast sort,
+    not perfect data. Accounts that 429/timeout sort to the end and fire
+    last; they still fire and the infinite-retry policy in attempt_withdraw
+    will eventually succeed for them.
+    """
+    try:
+        headers = build_headers(acc["cookie"], referer_path="/dashboard")
+        resp = requests.get(USER_API_URL, headers=headers, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return -1.0
+    if resp.status_code != 200:
+        return -1.0
+    try:
+        parsed = resp.json()
+    except Exception:  # noqa: BLE001
+        return -1.0
+    if not isinstance(parsed, dict):
+        return -1.0
+    for field in (
+        "currentBalance", "balanceSolTask", "balanceSol",
+        "balance", "claimable", "claimableSol",
+    ):
+        v = parsed.get(field)
+        if isinstance(v, (int, float)):
+            return float(v)
+        for sub in parsed.values():
+            if isinstance(sub, dict) and field in sub:
+                vv = sub[field]
+                if isinstance(vv, (int, float)):
+                    return float(vv)
+    return -1.0
+
+
+def priority_sort_accounts(
+    accounts: list[dict],
+    log: Logger,
+    priority_name: str = PRIORITY_ACCOUNT_NAME,
+    fetch_timeout: float = 3.0,
+    max_workers: int = 50,
+) -> list[dict]:
+    """Order accounts: ``priority_name`` first, then by claimable balance desc.
+
+    Pre-fire balance fetch is parallel one-shot (no retries) with
+    ``fetch_timeout`` per request, so total added latency before fire is
+    capped at roughly ``fetch_timeout`` seconds even with 100 accounts.
+    Accounts whose balance fetch fails get balance=-1 and sort to the end
+    — they still fire, just last.
+    """
+    priority = [a for a in accounts if a.get("name") == priority_name]
+    others = [a for a in accounts if a.get("name") != priority_name]
+
+    if not others:
+        return priority
+
+    t0 = time.time()
+    balances: dict[str, float] = {}
+    workers = min(max_workers, len(others))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="prio") as pool:
+        futs = {
+            pool.submit(_quick_balance, a, fetch_timeout): a["name"]
+            for a in others
+        }
+        for fut in as_completed(futs):
+            name = futs[fut]
+            try:
+                balances[name] = fut.result()
+            except Exception:  # noqa: BLE001
+                balances[name] = -1.0
+
+    others.sort(key=lambda a: -balances.get(a["name"], -1.0))
+
+    elapsed = time.time() - t0
+    fetched_ok = sum(1 for v in balances.values() if v >= 0)
+    failed = len(others) - fetched_ok
+    top_n = min(5, len(others))
+    top_preview = ", ".join(
+        f"{a['name']}={balances.get(a['name'], -1):.6f}"
+        for a in others[:top_n]
+    )
+    head = f"{priority_name} (priority) + " if priority else ""
+    log(
+        f"[priority] sorted in {elapsed:.1f}s | order: {head}"
+        f"{fetched_ok}/{len(others)} balances fetched"
+        + (f" ({failed} failed -> last)" if failed else "")
+        + f" | top {top_n}: {top_preview}"
+    )
+    return priority + others
 
 
 def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
