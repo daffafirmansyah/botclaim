@@ -66,7 +66,7 @@ def main() -> int:
 
     # ---- Load config + state -------------------------------------------------
     try:
-        accounts = core.load_accounts("config.json")
+        accounts = core.load_accounts()
     except SystemExit:
         raise
     except Exception as e:
@@ -82,7 +82,7 @@ def main() -> int:
     state = {}
     if not args.no_state:
         try:
-            state = core.load_state("state.json")
+            state = core.load_state()
         except Exception:
             state = {}
 
