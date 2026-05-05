@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -50,9 +51,20 @@ def tasks_complete_url(task_id: int | str) -> str:
     return f"{BASE_URL}/api/tasks/{task_id}/complete"
 
 # Solana RPC endpoints, tried in order. First success wins; last-known-good
-# is remembered and preferred afterwards. Only free, no-API-key endpoints
-# that were verified live are listed here.
+# is remembered and preferred afterwards.
+#
+# Helius is the primary because monitor.py polls every 1s (60 req/min) and
+# fires bursts during topups; public RPCs rate-limit hard under that load.
+# The API key is read from $HELIUS_API_KEY first (rotate without commit),
+# falling back to the hardcoded key for VPS convenience.
+HELIUS_API_KEY = os.environ.get(
+    "HELIUS_API_KEY",
+    "4861e563-4c9c-40d9-8e36-aedd41b2a3e3",
+)
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
 SOLANA_RPCS = [
+    HELIUS_RPC,
     "https://api.mainnet-beta.solana.com",
     "https://solana-rpc.publicnode.com",
 ]
