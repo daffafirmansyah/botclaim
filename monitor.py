@@ -51,7 +51,7 @@ from core import (
 # Tunables
 # ---------------------------------------------------------------------------
 
-POLL_INTERVAL_SEC = 10
+POLL_INTERVAL_SEC = 1
 # 0.1 SOL — only fire on real admin refills, not dust / tx-fee noise.
 # Tune after observing typical topup sizes on qolvex's hot wallet.
 TOPUP_THRESHOLD_LAMPORTS = 100_000_000
@@ -65,14 +65,13 @@ PER_ACCOUNT_SPACING_SEC = 5
 # is detected, instead of sequential with INTER_ACCOUNT_SPACING_SEC between
 # them. Trade-off: makes the burst pattern from one IP more visible to WAF.
 PARALLEL_FIRE = True
-MAX_PARALLEL_WORKERS = 10
+MAX_PARALLEL_WORKERS = 50
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
-# before its first request fires. 500ms = moderate: first 10 accts fire in
-# ~5s (still good snipe window), rest trickle across ~50s for 100 accts.
-# Previous 2ms burst (all 32 workers in <100ms) triggered qolvex's
-# 'max 3 accounts per wallet' 403 during 2026-05-03 parallel run.
-# Raise to 1000-2000 if 403 wallet-limit still appears under load.
-PARALLEL_STAGGER_MS = 500
+# before its first request fires. 2ms = pure burst: 100 accts dispatched in
+# ~200ms. Risk: WAF / 'max 3 accounts per wallet' 403 (seen 2026-05-03),
+# 429 per-IP rate-limit storm. Mitigated by core.py infinite retry on
+# 429/5xx — eventual success but log noise will be heavy.
+PARALLEL_STAGGER_MS = 2
 
 # Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5

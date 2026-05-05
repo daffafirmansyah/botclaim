@@ -34,14 +34,13 @@ from core import (
 # Parallel firing: send all account POSTs concurrently. Set False to fall
 # back to a sequential loop with INTER_ACCOUNT_SPACING_SEC between requests.
 PARALLEL_FIRE = True
-MAX_PARALLEL_WORKERS = 5
+MAX_PARALLEL_WORKERS = 50
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
-# before its first request fires. 1000ms spacing chosen to dodge qolvex's
-# 'max 3 accounts per wallet' 403 seen during burst runs (2026-05-03):
-# at 5 workers + 1s stagger, never more than ~3 accts fire per 1-sec window.
-# For 100 accts: dispatch window ~100s, max 5 in-flight.
-# Raise to 2000/5000 if 403 wallet-limit appears, or drop to 0 for pure burst.
-PARALLEL_STAGGER_MS = 1000
+# before its first request fires. 2ms = pure burst: 100 accts dispatched in
+# ~200ms. Risk: WAF / 'max 3 accounts per wallet' 403 (seen 2026-05-03),
+# 429 per-IP rate-limit storm. Mitigated by core.py infinite retry on
+# 429/5xx — eventual success but log noise will be heavy.
+PARALLEL_STAGGER_MS = 2
 
 # Sequential fallback only.
 INTER_ACCOUNT_SPACING_SEC = 5
