@@ -28,18 +28,14 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
 
 from core import (
-    DAILY_COOLDOWN_SEC,
     EXIT_COOLDOWN,
     EXIT_OK,
     HOT_WALLET,
     attempt_withdraw,
-    bootstrap_last_success_iso,
     get_account_state,
     get_balance_lamports,
-    iso_to_unix,
     load_accounts,
     load_state,
     make_logger,
@@ -94,108 +90,33 @@ def _handle_sigint(signum, frame):  # noqa: ARG001
     print("\n[monitor] stop requested, finishing current iteration...", flush=True)
 
 
-def _human_duration(sec: float) -> str:
-    sec = max(0, int(sec))
-    h, r = divmod(sec, 3600)
-    m, s = divmod(r, 60)
-    if h:
-        return f"{h}h{m:02d}m{s:02d}s"
-    if m:
-        return f"{m}m{s:02d}s"
-    return f"{s}s"
-
-
-def _seconds_until_cooldown_ends(last_success_iso: Optional[str], now: float) -> float:
-    if not last_success_iso:
-        return 0.0
-    remaining = (iso_to_unix(last_success_iso) + DAILY_COOLDOWN_SEC) - now
-    return max(0.0, remaining)
-
-
 def _eligible_accounts(accounts: list[dict], state: dict, now: float) -> list[dict]:
+    """Eligible = not fired in the last PER_ACCOUNT_SPACING_SEC seconds.
+
+    Qolvex has no per-account 24h cooldown (claim is per-topup-event), so the
+    only gate is a short debounce to prevent double-firing the same account
+    if monitor.py detects two near-simultaneous topup deltas.
+    """
     eligible: list[dict] = []
     for acc in accounts:
         entry = get_account_state(state, acc["name"])
-        if _seconds_until_cooldown_ends(entry["last_success_at"], now) > 0:
-            continue
         if now - float(entry["last_attempt_ts"]) < PER_ACCOUNT_SPACING_SEC:
             continue
         eligible.append(acc)
     return eligible
 
 
-def _bootstrap_accounts(accounts: list[dict], state: dict, log) -> None:
-    """
-    Fill last_success_at for each account from chain. Accounts that SHARE
-    a wallet_address with any other account are SKIPPED (bootstrap can't
-    distinguish them on-chain).
-    """
-    wallet_count: dict[str, int] = {}
-    for acc in accounts:
-        w = acc.get("wallet_address", "")
-        wallet_count[w] = wallet_count.get(w, 0) + 1
-
-    shared_wallets: dict[str, list[str]] = {}
-    for acc in accounts:
-        w = acc.get("wallet_address", "")
-        if wallet_count.get(w, 0) > 1:
-            shared_wallets.setdefault(w, []).append(acc["name"])
-
-    for wallet, names in shared_wallets.items():
-        preview = ", ".join(names[:3])
-        if len(names) > 3:
-            preview += f", ... +{len(names) - 3} more"
-        log(
-            f"[bootstrap-skip] wallet {wallet[:8]}...{wallet[-4:]} is shared "
-            f"by {len(names)} account(s) [{preview}]; on-chain scan can't "
-            "distinguish them, leaving cooldown untracked until first fire."
-        )
-
-        entries = [get_account_state(state, n) for n in names]
-        never_fired = all(
-            float(e.get("last_attempt_ts", 0.0) or 0.0) == 0.0 for e in entries
-        )
-        poisoned = [
-            n for n, e in zip(names, entries)
-            if e.get("last_success_at") is not None
-        ]
-        if never_fired and poisoned:
-            log(
-                f"[bootstrap-heal] clearing stale last_success_at on "
-                f"{len(poisoned)} account(s) under {wallet[:8]}...{wallet[-4:]} "
-                "(bootstrap artifact from a previous run)."
-            )
-            for entry in entries:
-                entry["last_success_at"] = None
-
-    for acc in accounts:
-        entry = get_account_state(state, acc["name"])
-        if entry["last_success_at"] is not None:
-            continue
-        if wallet_count.get(acc.get("wallet_address", ""), 0) > 1:
-            continue
-        log(f"[{acc['name']}] [bootstrap] scanning chain for last hot-wallet payout...")
-        discovered = bootstrap_last_success_iso(acc["wallet_address"], log)
-        if discovered:
-            entry["last_success_at"] = discovered
-    save_state(state)
-
-
 def _log_startup_status(accounts: list[dict], state: dict, log) -> None:
-    now = time.time()
-    for acc in accounts:
-        entry = get_account_state(state, acc["name"])
-        lsa = entry["last_success_at"]
-        if lsa:
-            cd = _seconds_until_cooldown_ends(lsa, now)
-            status = (
-                f"ready ({_human_duration(-cd)} past cooldown)"
-                if cd <= 0
-                else f"cooldown ends in {_human_duration(cd)}"
-            )
-            log(f"[{acc['name']}] last success {lsa}, {status}")
-        else:
-            log(f"[{acc['name']}] no prior success; will attempt on first top-up.")
+    """One-line summary on startup; no per-account cooldown to report."""
+    prior = sum(
+        1
+        for a in accounts
+        if get_account_state(state, a["name"])["last_success_at"]
+    )
+    log(
+        f"startup: {len(accounts)} account(s) ready "
+        f"({prior} have prior success, {len(accounts) - prior} first-time)."
+    )
 
 
 def _record_attempt_outcome(
@@ -207,15 +128,13 @@ def _record_attempt_outcome(
     entry = get_account_state(state, acc["name"])
     if exit_code == EXIT_OK:
         entry["last_success_at"] = utc_now_iso()
-        log(
-            f"[{acc['name']}] [ok] success; next attempt earliest in "
-            f"{_human_duration(DAILY_COOLDOWN_SEC)}."
-        )
+        log(f"[{acc['name']}] [ok] success.")
     elif exit_code == EXIT_COOLDOWN:
+        # Qolvex isn't expected to return cooldown; defensive fallback.
         entry["last_success_at"] = utc_now_iso()
-        log(f"[{acc['name']}] [cooldown] server refused; assuming 24h from now.")
+        log(f"[{acc['name']}] [cooldown] server refused (unexpected on qolvex).")
     else:
-        log(f"[{acc['name']}] [error] failed (exit={exit_code}); keep cooldown unchanged.")
+        log(f"[{acc['name']}] [error] failed (exit={exit_code}).")
 
 
 def _fire_one_threaded(
@@ -329,75 +248,23 @@ def _process_topup(
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Qolvex watch-loop auto-withdraw.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python monitor.py                      # normal run (no chain bootstrap)\n"
-            "  python monitor.py --bootstrap          # seed last_success_at from on-chain history (unique-wallet setups only)\n"
-            "  python monitor.py --reset-cooldowns    # clear all cooldowns on startup\n"
-        ),
-    )
-    p.add_argument(
-        "--reset-cooldowns",
-        action="store_true",
-        help=(
-            "Clear last_success_at and last_attempt_ts for every account on "
-            "startup, then skip the bootstrap chain scan."
-        ),
-    )
-    p.add_argument(
-        "--bootstrap",
-        action="store_true",
-        help=(
-            "Run the on-chain scan to seed last_success_at for accounts "
-            "with no prior history. DEFAULT IS OFF — multi-account setups "
-            "sharing one destination wallet would get the same (wrong) "
-            "cooldown. Pass this flag if you have unique wallets per account."
-        ),
-    )
+    p = argparse.ArgumentParser(description="Qolvex watch-loop auto-withdraw.")
     return p.parse_args()
 
 
-def _reset_cooldowns(accounts: list[dict], state: dict, log) -> None:
-    cleared = 0
-    for acc in accounts:
-        entry = get_account_state(state, acc["name"])
-        had_success = entry.get("last_success_at") is not None
-        entry["last_success_at"] = None
-        entry["last_attempt_ts"] = 0.0
-        if had_success:
-            cleared += 1
-    save_state(state)
-    log(
-        f"[reset] cleared cooldown for {cleared} of {len(accounts)} account(s). "
-        "All accounts will be eligible on the next top-up."
-    )
-
-
 def main() -> int:
-    args = _parse_args()
+    _parse_args()
     accounts = load_accounts()
     log = make_logger("monitor.log")
     signal.signal(signal.SIGINT, _handle_sigint)
 
     log(
         f"monitor started | accounts={len(accounts)} "
-        f"poll={POLL_INTERVAL_SEC}s topup>={TOPUP_THRESHOLD_LAMPORTS/1e9:.6f} SOL "
-        f"reset_cooldowns={args.reset_cooldowns} bootstrap={args.bootstrap}"
+        f"poll={POLL_INTERVAL_SEC}s topup>={TOPUP_THRESHOLD_LAMPORTS/1e9:.6f} SOL"
     )
     log(f"watching hot wallet: {HOT_WALLET}")
 
     state = load_state()
-
-    if args.reset_cooldowns:
-        _reset_cooldowns(accounts, state, log)
-    elif args.bootstrap:
-        _bootstrap_accounts(accounts, state, log)
-    else:
-        log("[bootstrap] skipped (default — use --bootstrap to opt in).")
-
     _log_startup_status(accounts, state, log)
 
     last_balance = int(state.get("last_hot_balance_lamports", 0))

@@ -90,9 +90,10 @@ EXIT_NETWORK = 4
 # tune after observing real qolvex behavior under load.
 RATE_LIMIT_WINDOW_SEC = 60
 RATE_LIMIT_MAX_REQS = 3
-# Daily cooldown between successful withdraws — use slightly under 24h so we
-# don't miss the earliest valid slot.
-DAILY_COOLDOWN_SEC = 23 * 3600 + 55 * 60  # 23h55m
+# NOTE: qolvex has no per-account 24h cooldown like claimyshare — claims
+# are per-topup-event. Cooldown logic was removed from monitor.py; the
+# EXIT_COOLDOWN exit code stays as a defensive fallback if the server
+# ever does return a 'too many withdrawals' response.
 
 # Auto-withdraw mode: skip withdraws for accounts whose claimable balance
 # is below this. Prevents burning rate-limit budget on dust or on accounts
@@ -437,66 +438,6 @@ def get_balance_lamports(address: str) -> int | None:
         return int(data["result"]["value"])
     except (KeyError, TypeError, ValueError):
         return None
-
-
-def bootstrap_last_success_iso(user_wallet: str, log: Logger) -> str | None:
-    """
-    Scan the user wallet's recent signatures for the most recent incoming
-    transfer from HOT_WALLET. Returns an ISO UTC timestamp, or None.
-
-    Used on first startup so the monitor knows the real daily cooldown
-    window before it attempts anything.
-    """
-    sigs_data = _rpc("getSignaturesForAddress", [user_wallet, {"limit": 25}])
-    if not sigs_data or not sigs_data.get("result"):
-        log("[bootstrap] could not fetch signatures; assuming no prior success.")
-        return None
-
-    for entry in sigs_data["result"]:
-        if entry.get("err"):
-            continue
-        sig = entry["signature"]
-        tx_data = _rpc(
-            "getTransaction",
-            [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
-        )
-        if not tx_data or not tx_data.get("result"):
-            continue
-        tx = tx_data["result"]
-        try:
-            keys = tx["transaction"]["message"]["accountKeys"]
-            signer_keys = [k for k in keys if k.get("signer")]
-            if not signer_keys:
-                continue
-            signer = signer_keys[0]["pubkey"]
-            if signer != HOT_WALLET:
-                continue
-            instructions = tx["transaction"]["message"]["instructions"]
-            is_payout = any(
-                ix.get("program") == "system"
-                and ix.get("parsed", {}).get("type") == "transfer"
-                and ix["parsed"]["info"].get("destination") == user_wallet
-                for ix in instructions
-            )
-            if not is_payout:
-                continue
-            block_time = tx.get("blockTime")
-            if not block_time:
-                continue
-            iso = datetime.fromtimestamp(block_time, tz=timezone.utc).strftime(
-                "%Y-%m-%dT%H:%M:%SZ"
-            )
-            log(f"[bootstrap] last payout from hot wallet at {iso} (sig {sig[:16]}...)")
-            return iso
-        except (KeyError, IndexError, TypeError):
-            continue
-
-    log("[bootstrap] no prior payout from hot wallet found in recent signatures.")
-    return None
-
-
-def iso_to_unix(iso: str) -> int:
-    return int(datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp())
 
 
 # ---------------------------------------------------------------------------
