@@ -35,7 +35,9 @@ from core import (
 # Parallel firing: send all account POSTs concurrently. Set False to fall
 # back to a sequential loop with INTER_ACCOUNT_SPACING_SEC between requests.
 PARALLEL_FIRE = True
-MAX_PARALLEL_WORKERS = 50
+# One worker per account so all 100 dispatch inside the stagger window even
+# if the early ones get stuck retrying on 429. See monitor.py for full notes.
+MAX_PARALLEL_WORKERS = 100
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
 # before its first request fires. 2ms = pure burst: 100 accts dispatched in
 # ~200ms. Risk: WAF / 'max 3 accounts per wallet' 403 (seen 2026-05-03),

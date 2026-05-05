@@ -62,7 +62,13 @@ PER_ACCOUNT_SPACING_SEC = 5
 # is detected, instead of sequential with INTER_ACCOUNT_SPACING_SEC between
 # them. Trade-off: makes the burst pattern from one IP more visible to WAF.
 PARALLEL_FIRE = True
-MAX_PARALLEL_WORKERS = 50
+# One worker per account so EVERY account dispatches inside the stagger
+# window regardless of how long the earlier ones spend retrying on 429/5xx.
+# Previously capped at 50 — accounts 51-100 had to wait for a worker slot,
+# and if the first 50 got stuck retrying for 30+s the back half never fired
+# in time before the hot wallet drained. 100 worker threads is fine: each
+# is mostly blocked on HTTP I/O (~20MB total memory, no CPU contention).
+MAX_PARALLEL_WORKERS = 100
 # Stagger the parallel dispatch so account #N waits N * PARALLEL_STAGGER_MS
 # before its first request fires. 2ms = pure burst: 100 accts dispatched in
 # ~200ms. Risk: WAF / 'max 3 accounts per wallet' 403 (seen 2026-05-03),
