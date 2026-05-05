@@ -21,8 +21,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 
 import core
 
@@ -33,14 +35,75 @@ def fmt_sol(x: float | None) -> str:
     return f"{x:>13.9f}"
 
 
-def fetch_one(acc: dict) -> tuple[str, float | None]:
-    """Return (name, balance_or_None). Silently swallows all log noise."""
-    silent_log = lambda *a, **kw: None  # noqa: E731
+_CANDIDATE_FIELDS = (
+    "currentBalance",
+    "balanceSolTask",
+    "balanceSol",
+    "balance",
+    "claimable",
+    "claimableSol",
+    "rewardSol",
+    "pendingSol",
+)
+
+
+def _classify(status: int) -> str:
+    """Map HTTP status to short human reason."""
+    return {
+        401: "cookie invalid/expired",
+        403: "forbidden (account flagged?)",
+        404: "endpoint 404",
+        429: "rate-limited (429)",
+        500: "qolvex 500",
+        502: "qolvex 502 bad gateway",
+        503: "qolvex 503 outage",
+        504: "qolvex 504 timeout",
+    }.get(status, f"http {status}")
+
+
+def fetch_one(acc: dict) -> dict:
+    """Return full diagnostic: name, balance, status, reason.
+
+    Bypasses core.fetch_claimable_balance so we can surface the real cause
+    of failures (401 vs 429 vs timeout etc.) instead of a silent None.
+    """
+    name = acc["name"]
     try:
-        bal = core.fetch_claimable_balance(acc, silent_log)
+        headers = core.build_headers(acc["cookie"], referer_path="/dashboard")
+    except Exception as e:
+        return {"name": name, "balance": None, "status": 0, "reason": f"bad-cookie-field: {e}"}
+
+    try:
+        resp = requests.get(core.USER_API_URL, headers=headers, timeout=15)
+    except requests.Timeout:
+        return {"name": name, "balance": None, "status": 0, "reason": "timeout (15s)"}
+    except requests.RequestException as e:
+        return {"name": name, "balance": None, "status": 0, "reason": f"net: {e.__class__.__name__}"}
+
+    status = resp.status_code
+    if status != 200:
+        return {"name": name, "balance": None, "status": status, "reason": _classify(status)}
+
+    try:
+        parsed = resp.json()
     except Exception:
-        bal = None
-    return acc["name"], bal
+        return {"name": name, "balance": None, "status": status, "reason": "non-JSON body"}
+
+    if not isinstance(parsed, dict):
+        return {"name": name, "balance": None, "status": status, "reason": "non-object body"}
+
+    # Search top-level then 1-level-nested (mirror core.fetch_claimable_balance).
+    for field in _CANDIDATE_FIELDS:
+        val = parsed.get(field)
+        if val is None:
+            for v in parsed.values():
+                if isinstance(v, dict) and field in v:
+                    val = v[field]
+                    break
+        if isinstance(val, (int, float)):
+            return {"name": name, "balance": float(val), "status": status, "reason": "ok"}
+
+    return {"name": name, "balance": None, "status": status, "reason": "no balance field in response"}
 
 
 def main() -> int:
@@ -89,23 +152,26 @@ def main() -> int:
     # ---- Fetch balances in parallel ------------------------------------------
     print(f"fetching balances for {len(accounts)} account(s) "
           f"(workers={args.workers}) ...", file=sys.stderr)
-    balances: dict[str, float | None] = {}
+    diags: dict[str, dict] = {}
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futs = {pool.submit(fetch_one, a): a for a in accounts}
         for fut in as_completed(futs):
-            name, bal = fut.result()
-            balances[name] = bal
+            r = fut.result()
+            diags[r["name"]] = r
 
     # ---- Render --------------------------------------------------------------
     rows = []
     for a in accounts:
-        bal = balances.get(a["name"])
+        d = diags.get(a["name"], {"balance": None, "status": 0, "reason": "no-result"})
+        bal = d["balance"]
         if bal is not None and bal < args.min:
             continue
         last = state.get(a["name"], {}).get("last_success_iso", "-")
         rows.append({
             "name": a["name"],
             "balance": bal,
+            "status": d["status"],
+            "reason": d["reason"],
             "wallet": a["wallet_address"],
             "last_success": last,
         })
@@ -124,9 +190,12 @@ def _render_flat(rows: list[dict]) -> None:
     print(header)
     print("-" * len(header))
     for r in sorted(rows, key=lambda r: (-(r["balance"] or -1), r["name"])):
+        suffix = ""
+        if r["balance"] is None:
+            suffix = f"  ({r['reason']})"
         print(
             f"{r['name']:<22} {fmt_sol(r['balance']):>15}  "
-            f"{r['wallet']:<46}  {r['last_success']}"
+            f"{r['wallet']:<46}  {r['last_success']}{suffix}"
         )
 
 
@@ -136,7 +205,6 @@ def _render_grouped(rows: list[dict]) -> None:
         groups[r["wallet"]].append(r)
 
     for i, (wallet, group) in enumerate(groups.items(), 1):
-        # wallet header with totals
         total = sum(r["balance"] for r in group if r["balance"] is not None)
         n_ok = sum(1 for r in group if r["last_success"] != "-")
         err_count = sum(1 for r in group if r["balance"] is None)
@@ -146,9 +214,10 @@ def _render_grouped(rows: list[dict]) -> None:
             f"[{len(group)}/3 accts, {n_ok} locked, total={total:.9f} SOL]{err_note}"
         )
         for r in group:
+            suffix = f"  ({r['reason']})" if r["balance"] is None else ""
             print(
                 f"    {r['name']:<22} {fmt_sol(r['balance'])}  "
-                f"last: {r['last_success']}"
+                f"last: {r['last_success']}{suffix}"
             )
 
 
@@ -162,14 +231,19 @@ def _render_summary(rows: list[dict]) -> None:
     print("\n" + "=" * 78)
     print(f"summary: {len(rows)} accounts shown")
     print(f"  ok fetch     : {len(ok)}")
-    print(f"  error fetch  : {len(err)}  (likely expired cookie or 429)")
+    print(f"  error fetch  : {len(err)}")
     print(f"  total balance: {total_bal:.9f} SOL")
     print(
         f"  withdrawable : {len(eligible)} acct(s) "
         f">= {core.MIN_WITHDRAW_SOL} SOL = {eligible_sum:.9f} SOL"
     )
     if err:
-        print(f"\n  error accounts: {[r['name'] for r in err]}")
+        reasons: Counter[str] = Counter(r["reason"] for r in err)
+        print("\n  error breakdown:")
+        for reason, n in reasons.most_common():
+            names = [r["name"] for r in err if r["reason"] == reason]
+            print(f"    {n:>3} x {reason}")
+            print(f"        {names}")
 
 
 if __name__ == "__main__":
