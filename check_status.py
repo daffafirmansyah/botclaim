@@ -12,10 +12,14 @@ Usage:
     python check_status.py --min 0.001    # hide accounts below this balance
 
 Flags:
-    --workers N       concurrent dashboard fetches (default 5, be gentle)
-    --retry N         extra rounds to re-fetch accounts that hit 429 (default 0)
-    --retry-wait SEC  seconds to sleep between retry rounds (default 60)
-    --no-state        don't read state.json (show '-' in Last Success column)
+    --workers N         concurrent dashboard fetches (default 5)
+    --retry N           re-fetch 429 accounts within the same run (default 0)
+    --retry-wait SEC    sleep between in-run retry rounds (default 60)
+    --skip-cached       skip accounts whose balance_cache.json entry is fresh
+    --fill-cache        multi-pass loop until cache full or N rounds elapsed
+    --fill-max-rounds N max passes in --fill-cache mode (default 6)
+    --fill-round-wait S sleep between fill-cache rounds (default 240s)
+    --no-state          don't read state.json (Last Success column shows '-')
 """
 
 from __future__ import annotations
@@ -133,6 +137,26 @@ def main() -> int:
         help="seconds to sleep between retry rounds (default 60)",
     )
     ap.add_argument(
+        "--skip-cached", action="store_true",
+        help="skip accounts whose balance_cache.json entry is fresh",
+    )
+    ap.add_argument(
+        "--fill-cache", action="store_true",
+        help=(
+            "multi-pass loop: each round fetch only missing/stale-cache "
+            "accounts, sleep between rounds. Stops when cache full or after "
+            "--fill-max-rounds passes."
+        ),
+    )
+    ap.add_argument(
+        "--fill-max-rounds", type=int, default=6,
+        help="max rounds in --fill-cache mode (default 6)",
+    )
+    ap.add_argument(
+        "--fill-round-wait", type=int, default=240,
+        help="seconds to sleep between fill-cache rounds (default 240)",
+    )
+    ap.add_argument(
         "--no-state", action="store_true",
         help="don't read state.json",
     )
@@ -152,6 +176,26 @@ def main() -> int:
         if not accounts:
             print(f"[abort] no account named {args.name!r} in config.json")
             return 1
+
+    if args.fill_cache:
+        return _fill_cache_mode(accounts, args)
+
+    if args.skip_cached:
+        cache = core.load_balance_cache()
+        now = time.time()
+        before = len(accounts)
+        accounts = [
+            a for a in accounts
+            if not _cache_fresh(cache.get(a["name"]), now)
+        ]
+        print(
+            f"[skip-cached] {before - len(accounts)} accounts already cached fresh, "
+            f"fetching {len(accounts)} stale/missing.",
+            file=sys.stderr,
+        )
+        if not accounts:
+            print("[skip-cached] cache fully fresh, nothing to fetch.", file=sys.stderr)
+            return 0
 
     state = {}
     if not args.no_state:
@@ -267,6 +311,110 @@ def _render_grouped(rows: list[dict]) -> None:
                 f"    {r['name']:<22} {fmt_sol(r['balance'])}  "
                 f"last: {r['last_success']}{suffix}"
             )
+
+
+def _cache_fresh(entry: dict | None, now: float) -> bool:
+    """True if balance_cache entry exists and is younger than the max age."""
+    if not entry:
+        return False
+    return now - float(entry.get("fetched_at", 0)) < core.BALANCE_CACHE_MAX_AGE_SEC
+
+
+def _fill_cache_mode(accounts: list[dict], args: argparse.Namespace) -> int:
+    """Loop fetch-and-cache until coverage 100% or fill_max_rounds reached.
+
+    Each round only fetches accounts whose cache entry is missing or stale.
+    Sleep between rounds gives qolvex's per-IP rate-limit bucket time to
+    refill so the next round catches what the previous one missed.
+    """
+    target = len(accounts)
+    print(
+        f"[fill] target {target} accounts; max {args.fill_max_rounds} rounds, "
+        f"{args.fill_round_wait}s between rounds.",
+        file=sys.stderr,
+    )
+
+    for round_n in range(1, args.fill_max_rounds + 1):
+        cache = core.load_balance_cache()
+        now = time.time()
+        missing = [a for a in accounts if not _cache_fresh(cache.get(a["name"]), now)]
+        have = target - len(missing)
+
+        print(
+            f"\n[fill round {round_n}/{args.fill_max_rounds}] "
+            f"cache: {have}/{target} fresh; fetching {len(missing)} missing/stale.",
+            file=sys.stderr,
+        )
+
+        if not missing:
+            print(f"[fill] cache 100% fresh after {round_n - 1} round(s). done.",
+                  file=sys.stderr)
+            return 0
+
+        # Round 1 uses user-configured workers; round 2+ goes serial (1 worker)
+        # to be maximally polite — we already burned the per-IP bucket.
+        workers = args.workers if round_n == 1 else 1
+        diags: dict[str, dict] = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(fetch_one, a): a for a in missing}
+            for fut in as_completed(futs):
+                r = fut.result()
+                diags[r["name"]] = r
+
+        # In-round retry for 429s
+        for retry_n in range(1, max(args.retry, 1) + 1):
+            rl = [n for n, d in diags.items() if d["status"] == 429]
+            if not rl:
+                break
+            print(
+                f"  [retry {retry_n}] {len(rl)} of {len(missing)} hit 429; "
+                f"sleeping {args.retry_wait}s, retrying serially.",
+                file=sys.stderr,
+            )
+            time.sleep(args.retry_wait)
+            by_name = {a["name"]: a for a in missing}
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                futs = {pool.submit(fetch_one, by_name[n]): n for n in rl}
+                for fut in as_completed(futs):
+                    r = fut.result()
+                    diags[r["name"]] = r
+
+        fresh = {n: d["balance"] for n, d in diags.items() if d["balance"] is not None}
+        if fresh:
+            core.update_balance_cache(fresh)
+        print(
+            f"  round {round_n} captured {len(fresh)}/{len(missing)} balances.",
+            file=sys.stderr,
+        )
+
+        # Re-evaluate after this round
+        cache_now = core.load_balance_cache()
+        have_now = sum(
+            1 for a in accounts if _cache_fresh(cache_now.get(a["name"]), time.time())
+        )
+        if have_now >= target:
+            print(
+                f"[fill] cache 100% fresh after round {round_n}. done.",
+                file=sys.stderr,
+            )
+            return 0
+
+        if round_n < args.fill_max_rounds:
+            print(
+                f"[fill] sleeping {args.fill_round_wait}s before next round.",
+                file=sys.stderr,
+            )
+            time.sleep(args.fill_round_wait)
+
+    cache_final = core.load_balance_cache()
+    have_final = sum(
+        1 for a in accounts if _cache_fresh(cache_final.get(a["name"]), time.time())
+    )
+    print(
+        f"\n[fill] reached max rounds. final coverage: {have_final}/{target}.",
+        file=sys.stderr,
+    )
+    return 0 if have_final == target else 1
 
 
 def _render_summary(rows: list[dict]) -> None:
