@@ -195,6 +195,18 @@ def main() -> int:
             file=sys.stderr,
         )
 
+    # ---- Persist balances to cache for priority_sort_accounts ----------------
+    fresh = {n: d["balance"] for n, d in diags.items() if d["balance"] is not None}
+    if fresh:
+        try:
+            core.update_balance_cache(fresh)
+            print(
+                f"[cache] wrote {len(fresh)} balance(s) to balance_cache.json",
+                file=sys.stderr,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"[cache] write failed: {e}", file=sys.stderr)
+
     # ---- Render --------------------------------------------------------------
     rows = []
     for a in accounts:

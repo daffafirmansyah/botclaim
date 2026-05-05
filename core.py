@@ -79,6 +79,14 @@ HOT_WALLET = "GXZBHbZiFoutudEXJM9HfKpBgyncAtukieGhxPQdne11"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 STATE_PATH = SCRIPT_DIR / "state.json"
+# Balance cache: written by check_status.py, read by priority_sort_accounts.
+# Decouples balance discovery from fire timing so per-IP rate-limit doesn't
+# blind the sort.
+BALANCE_CACHE_PATH = SCRIPT_DIR / "balance_cache.json"
+# Cache entries older than this are ignored by the sort (treated as missing).
+# 30 minutes is generous — balances grow slowly between topups, so a half-hour
+# old reading is still a great proxy for ranking accounts by haul size.
+BALANCE_CACHE_MAX_AGE_SEC = 30 * 60
 
 # Exit codes (used by withdraw.py; monitor.py uses them internally).
 EXIT_OK = 0
@@ -651,20 +659,64 @@ def _quick_balance(acc: dict, timeout: float = 3.0) -> float:
     return -1.0
 
 
+def load_balance_cache() -> dict[str, dict]:
+    """Read {name -> {value, fetched_at}} from balance_cache.json.
+
+    Returns empty dict if file missing or malformed.
+    """
+    if not BALANCE_CACHE_PATH.exists():
+        return {}
+    try:
+        raw = BALANCE_CACHE_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return {}
+    cache = data.get("balances", {})
+    return cache if isinstance(cache, dict) else {}
+
+
+def update_balance_cache(new_values: dict[str, float | None]) -> None:
+    """Merge fresh {name -> balance} readings into balance_cache.json.
+
+    None / missing values are skipped (we don't want to clobber a known
+    balance with a None from a transient 429). Each entry is timestamped
+    independently so partial updates work cleanly.
+    """
+    if not new_values:
+        return
+    existing = load_balance_cache()
+    now = time.time()
+    for name, value in new_values.items():
+        if value is None or (isinstance(value, float) and value < 0):
+            continue
+        existing[name] = {"value": float(value), "fetched_at": now}
+    payload = {"balances": existing}
+    tmp = BALANCE_CACHE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(BALANCE_CACHE_PATH)
+
+
 def priority_sort_accounts(
     accounts: list[dict],
     log: Logger,
     priority_name: str = PRIORITY_ACCOUNT_NAME,
     fetch_timeout: float = 3.0,
     max_workers: int = 50,
+    cache_max_age_sec: float = BALANCE_CACHE_MAX_AGE_SEC,
 ) -> list[dict]:
     """Order accounts: ``priority_name`` first, then by claimable balance desc.
 
-    Pre-fire balance fetch is parallel one-shot (no retries) with
-    ``fetch_timeout`` per request, so total added latency before fire is
-    capped at roughly ``fetch_timeout`` seconds even with 100 accounts.
-    Accounts whose balance fetch fails get balance=-1 and sort to the end
-    — they still fire, just last.
+    Strategy:
+      1. Read balance_cache.json (populated by check_status.py).
+      2. For accounts whose cache entry is fresh (< cache_max_age_sec), use it.
+      3. For accounts missing or stale, do a parallel one-shot live fetch.
+      4. Sort: priority first, then known balance desc, then unknowns last
+         (config order).
+
+    Live fetch is bounded by ``fetch_timeout`` per request, so total added
+    latency stays low even when most accounts need it. Run check_status.py
+    --retry 2 periodically to keep the cache warm and skip the live fetch
+    almost entirely.
     """
     priority = [a for a in accounts if a.get("name") == priority_name]
     others = [a for a in accounts if a.get("name") != priority_name]
@@ -672,26 +724,46 @@ def priority_sort_accounts(
     if not others:
         return priority
 
-    t0 = time.time()
+    cache = load_balance_cache()
+    now = time.time()
     balances: dict[str, float] = {}
-    workers = min(max_workers, len(others))
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="prio") as pool:
-        futs = {
-            pool.submit(_quick_balance, a, fetch_timeout): a["name"]
-            for a in others
-        }
-        for fut in as_completed(futs):
-            name = futs[fut]
-            try:
-                balances[name] = fut.result()
-            except Exception:  # noqa: BLE001
-                balances[name] = -1.0
+    needs_live: list[dict] = []
+
+    for a in others:
+        entry = cache.get(a["name"])
+        if entry and now - float(entry.get("fetched_at", 0)) < cache_max_age_sec:
+            balances[a["name"]] = float(entry.get("value", -1.0))
+        else:
+            needs_live.append(a)
+
+    cache_hits = len(others) - len(needs_live)
+    t0 = time.time()
+    live_fetched = 0
+    if needs_live:
+        workers = min(max_workers, len(needs_live))
+        live_results: dict[str, float] = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="prio") as pool:
+            futs = {
+                pool.submit(_quick_balance, a, fetch_timeout): a["name"]
+                for a in needs_live
+            }
+            for fut in as_completed(futs):
+                name = futs[fut]
+                try:
+                    val = fut.result()
+                except Exception:  # noqa: BLE001
+                    val = -1.0
+                live_results[name] = val
+                balances[name] = val
+        live_fetched = sum(1 for v in live_results.values() if v >= 0)
+        # Persist the fresh values so subsequent runs hit cache.
+        update_balance_cache(live_results)
 
     others.sort(key=lambda a: -balances.get(a["name"], -1.0))
 
     elapsed = time.time() - t0
-    fetched_ok = sum(1 for v in balances.values() if v >= 0)
-    failed = len(others) - fetched_ok
+    known = sum(1 for v in balances.values() if v >= 0)
+    unknown = len(others) - known
     top_n = min(5, len(others))
     top_preview = ", ".join(
         f"{a['name']}={balances.get(a['name'], -1):.6f}"
@@ -700,8 +772,9 @@ def priority_sort_accounts(
     head = f"{priority_name} (priority) + " if priority else ""
     log(
         f"[priority] sorted in {elapsed:.1f}s | order: {head}"
-        f"{fetched_ok}/{len(others)} balances fetched"
-        + (f" ({failed} failed -> last)" if failed else "")
+        f"cache_hits={cache_hits}/{len(others)}, "
+        f"live_ok={live_fetched}/{len(needs_live)}"
+        + (f", {unknown} unknown -> last" if unknown else "")
         + f" | top {top_n}: {top_preview}"
     )
     return priority + others
