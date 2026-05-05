@@ -12,8 +12,10 @@ Usage:
     python check_status.py --min 0.001    # hide accounts below this balance
 
 Flags:
-    --workers N   concurrent dashboard fetches (default 5, be gentle)
-    --no-state    don't read state.json (show '-' in Last Success column)
+    --workers N       concurrent dashboard fetches (default 5, be gentle)
+    --retry N         extra rounds to re-fetch accounts that hit 429 (default 0)
+    --retry-wait SEC  seconds to sleep between retry rounds (default 60)
+    --no-state        don't read state.json (show '-' in Last Success column)
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -122,6 +125,14 @@ def main() -> int:
         help="parallel dashboard fetches (default 5)",
     )
     ap.add_argument(
+        "--retry", type=int, default=0,
+        help="extra rounds to re-fetch accounts that hit 429 (default 0)",
+    )
+    ap.add_argument(
+        "--retry-wait", type=int, default=60,
+        help="seconds to sleep between retry rounds (default 60)",
+    )
+    ap.add_argument(
         "--no-state", action="store_true",
         help="don't read state.json",
     )
@@ -158,6 +169,31 @@ def main() -> int:
         for fut in as_completed(futs):
             r = fut.result()
             diags[r["name"]] = r
+
+    # ---- Retry rounds for 429-only (rate-limited) ---------------------------
+    by_name = {a["name"]: a for a in accounts}
+    for round_n in range(1, args.retry + 1):
+        rl_names = [n for n, d in diags.items() if d["status"] == 429]
+        if not rl_names:
+            break
+        print(
+            f"[retry {round_n}/{args.retry}] {len(rl_names)} accounts hit 429; "
+            f"sleeping {args.retry_wait}s then re-fetching serially ...",
+            file=sys.stderr,
+        )
+        time.sleep(args.retry_wait)
+        # Use 1 worker for retries — max politeness.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            futs = {pool.submit(fetch_one, by_name[n]): n for n in rl_names}
+            for fut in as_completed(futs):
+                r = fut.result()
+                diags[r["name"]] = r
+        still = sum(1 for n in rl_names if diags[n]["status"] == 429)
+        print(
+            f"[retry {round_n}/{args.retry}] done: recovered "
+            f"{len(rl_names) - still}/{len(rl_names)}",
+            file=sys.stderr,
+        )
 
     # ---- Render --------------------------------------------------------------
     rows = []
