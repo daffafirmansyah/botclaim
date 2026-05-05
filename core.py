@@ -83,10 +83,13 @@ STATE_PATH = SCRIPT_DIR / "state.json"
 # Decouples balance discovery from fire timing so per-IP rate-limit doesn't
 # blind the sort.
 BALANCE_CACHE_PATH = SCRIPT_DIR / "balance_cache.json"
-# Cache entries older than this are ignored by the sort (treated as missing).
-# 30 minutes is generous — balances grow slowly between topups, so a half-hour
-# old reading is still a great proxy for ranking accounts by haul size.
-BALANCE_CACHE_MAX_AGE_SEC = 30 * 60
+# Cache entries older than this trigger a live-fetch refresh attempt. If that
+# refresh fails (per-IP rate-limit), priority_sort_accounts falls back to the
+# stale cache value rather than -1, so high-balance accounts keep their slot
+# even when the refresh round gets blocked.
+# 2 hours is a sweet spot: balances change slowly between topups, and most
+# users run fill-cache or cron more often than this anyway.
+BALANCE_CACHE_MAX_AGE_SEC = 2 * 3600
 
 # Exit codes (used by withdraw.py; monitor.py uses them internally).
 EXIT_OK = 0
@@ -728,17 +731,25 @@ def priority_sort_accounts(
     now = time.time()
     balances: dict[str, float] = {}
     needs_live: list[dict] = []
+    stale_fallback: dict[str, float] = {}  # last-known good values for stale entries
 
     for a in others:
-        entry = cache.get(a["name"])
+        name = a["name"]
+        entry = cache.get(name)
         if entry and now - float(entry.get("fetched_at", 0)) < cache_max_age_sec:
-            balances[a["name"]] = float(entry.get("value", -1.0))
+            balances[name] = float(entry.get("value", -1.0))
         else:
             needs_live.append(a)
+            # Remember any stale value so we can fall back if live fetch fails.
+            if entry and "value" in entry:
+                val = float(entry["value"])
+                if val >= 0:
+                    stale_fallback[name] = val
 
     cache_hits = len(others) - len(needs_live)
     t0 = time.time()
     live_fetched = 0
+    fallback_used = 0
     if needs_live:
         workers = min(max_workers, len(needs_live))
         live_results: dict[str, float] = {}
@@ -754,9 +765,14 @@ def priority_sort_accounts(
                 except Exception:  # noqa: BLE001
                     val = -1.0
                 live_results[name] = val
-                balances[name] = val
+                # Apply stale fallback if live fetch failed but we have an old reading.
+                if val < 0 and name in stale_fallback:
+                    balances[name] = stale_fallback[name]
+                    fallback_used += 1
+                else:
+                    balances[name] = val
         live_fetched = sum(1 for v in live_results.values() if v >= 0)
-        # Persist the fresh values so subsequent runs hit cache.
+        # Persist only the successful live values; stale fallbacks already in cache.
         update_balance_cache(live_results)
 
     others.sort(key=lambda a: -balances.get(a["name"], -1.0))
@@ -770,10 +786,12 @@ def priority_sort_accounts(
         for a in others[:top_n]
     )
     head = f"{priority_name} (priority) + " if priority else ""
+    fallback_note = f", stale_fallback={fallback_used}" if fallback_used else ""
     log(
         f"[priority] sorted in {elapsed:.1f}s | order: {head}"
         f"cache_hits={cache_hits}/{len(others)}, "
         f"live_ok={live_fetched}/{len(needs_live)}"
+        + fallback_note
         + (f", {unknown} unknown -> last" if unknown else "")
         + f" | top {top_n}: {top_preview}"
     )
