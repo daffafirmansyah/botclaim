@@ -91,7 +91,9 @@ INTER_ACCOUNT_SPACING_SEC = 5
 BALANCE_REFRESH_ENABLED = True
 BALANCE_REFRESH_INTERVAL_SEC = 120        # sweep every 2 minutes
 BALANCE_REFRESH_WORKERS = 10              # safe under rotating proxy (was 2)
-BALANCE_REFRESH_FETCH_TIMEOUT_SEC = 5     # per-request timeout in the sweep
+BALANCE_REFRESH_FETCH_TIMEOUT_SEC = 10    # per-request timeout (proxy adds latency)
+BALANCE_REFRESH_RETRY_FAILED = True       # retry once within the same sweep
+BALANCE_REFRESH_LOG_FAILED_NAMES = True   # log up to 5 failed account names per cycle
 # Anything older than this is considered stale and gets re-fetched.
 # Setting it equal to the interval = every account refreshed every cycle
 # (subject to per-IP rate-limit; failed fetches don't update fetched_at,
@@ -317,31 +319,58 @@ def _balance_refresh_loop(accounts: list[dict], log) -> None:
                 _sleep_with_stop(BALANCE_REFRESH_INTERVAL_SEC)
                 continue
 
-            results: dict[str, float] = {}
-            workers = min(BALANCE_REFRESH_WORKERS, len(stale))
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="refresh"
-            ) as pool:
-                futs = {
-                    pool.submit(
-                        _quick_balance, a, BALANCE_REFRESH_FETCH_TIMEOUT_SEC
-                    ): a["name"]
-                    for a in stale
-                }
-                for fut in as_completed(futs):
-                    name = futs[fut]
-                    try:
-                        results[name] = fut.result()
-                    except Exception:  # noqa: BLE001
-                        results[name] = -1.0
-                    if _stop:
-                        break
+            def _run_pool(targets: list[dict]) -> dict[str, float]:
+                out: dict[str, float] = {}
+                if not targets:
+                    return out
+                workers = min(BALANCE_REFRESH_WORKERS, len(targets))
+                with ThreadPoolExecutor(
+                    max_workers=workers, thread_name_prefix="refresh"
+                ) as pool:
+                    futs = {
+                        pool.submit(
+                            _quick_balance, a, BALANCE_REFRESH_FETCH_TIMEOUT_SEC
+                        ): a["name"]
+                        for a in targets
+                    }
+                    for fut in as_completed(futs):
+                        name = futs[fut]
+                        try:
+                            out[name] = fut.result()
+                        except Exception:  # noqa: BLE001
+                            out[name] = -1.0
+                        if _stop:
+                            break
+                return out
+
+            # Pass 1: live-fetch all stale entries.
+            results = _run_pool(stale)
+            recovered = 0
+            # Pass 2: retry any that failed once (covers transient proxy slow
+            # IPs / sesaat 429 / network jitter). Persistent failures (e.g.
+            # cookie expired) will still fail and surface in the log.
+            if BALANCE_REFRESH_RETRY_FAILED and not _stop:
+                retry_targets = [a for a in stale if results.get(a["name"], -1.0) < 0]
+                if retry_targets:
+                    retry_results = _run_pool(retry_targets)
+                    for name, val in retry_results.items():
+                        if val >= 0:
+                            recovered += 1
+                        results[name] = val
 
             ok = sum(1 for v in results.values() if v >= 0)
             update_balance_cache(results)
+            failed_names = [n for n, v in results.items() if v < 0]
+            extra = ""
+            if recovered:
+                extra += f", recovered_on_retry={recovered}"
+            if BALANCE_REFRESH_LOG_FAILED_NAMES and failed_names:
+                shown = ", ".join(sorted(failed_names)[:5])
+                more = f" (+{len(failed_names) - 5} more)" if len(failed_names) > 5 else ""
+                extra += f" | failed_accounts: {shown}{more}"
             log(
                 f"[refresh] swept {len(stale)} stale/missing | "
-                f"updated={ok}, failed={len(results) - ok}"
+                f"updated={ok}, failed={len(results) - ok}{extra}"
             )
         except Exception as e:  # noqa: BLE001
             log(f"[refresh] cycle error (continuing): {e}")
