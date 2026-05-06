@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 
 import requests
 
+import core
 from core import (
     EXIT_API_ERROR,
     EXIT_OK,
@@ -329,6 +330,7 @@ def fetch_tasks(cookie: str, log=None, label: str = "") -> list[dict]:
             TASKS_LIST_URL,
             headers=_tasks_list_headers(cookie),
             timeout=HTTP_TIMEOUT_SEC,
+            proxies=core.get_proxies(),
         )
         # 429 — keep retrying forever
         if resp.status_code == 429:
@@ -380,6 +382,7 @@ def complete_task(
                 headers=_task_complete_headers(cookie, task_id),
                 json=TASK_COMPLETE_BODY,
                 timeout=HTTP_TIMEOUT_SEC,
+                proxies=core.get_proxies(),
             )
         except requests.RequestException as e:
             return 0, {"error": f"network: {e}"}

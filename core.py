@@ -91,6 +91,39 @@ BALANCE_CACHE_PATH = SCRIPT_DIR / "balance_cache.json"
 # users run fill-cache or cron more often than this anyway.
 BALANCE_CACHE_MAX_AGE_SEC = 2 * 3600
 
+# Optional proxy for ALL qolvex traffic (not Solana RPC). One line in
+# proxy.txt, e.g. "socks5h://USER:PASS@gw.dataimpulse.com:823" for rotating
+# DataImpulse residential proxies. With proxy active, per-IP rate-limit
+# (429) is rotated away every request, letting the parallel fire and
+# background refresh thread run aggressively without being blocked.
+PROXY_PATH = SCRIPT_DIR / "proxy.txt"
+
+
+def _load_proxy_url() -> str | None:
+    """Read the first non-comment line of proxy.txt as the proxy URL."""
+    if not PROXY_PATH.exists():
+        return None
+    try:
+        raw = PROXY_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in raw.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return None
+
+
+# Loaded once at import; restart the process to pick up proxy.txt changes.
+PROXY_URL: str | None = _load_proxy_url()
+
+
+def get_proxies() -> dict | None:
+    """Return a {'http', 'https'} dict for requests, or None if no proxy."""
+    if not PROXY_URL:
+        return None
+    return {"http": PROXY_URL, "https": PROXY_URL}
+
 # Exit codes (used by withdraw.py; monitor.py uses them internally).
 EXIT_OK = 0
 EXIT_CONFIG = 1
@@ -636,7 +669,9 @@ def _quick_balance(acc: dict, timeout: float = 3.0) -> float:
     """
     try:
         headers = build_headers(acc["cookie"], referer_path="/dashboard")
-        resp = requests.get(USER_API_URL, headers=headers, timeout=timeout)
+        resp = requests.get(
+            USER_API_URL, headers=headers, timeout=timeout, proxies=get_proxies()
+        )
     except Exception:  # noqa: BLE001
         return -1.0
     if resp.status_code != 200:
@@ -836,7 +871,9 @@ def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
     resp = None
     for attempt in range(BALANCE_FETCH_429_MAX_RETRIES + 1):
         try:
-            resp = requests.get(USER_API_URL, headers=headers, timeout=15)
+            resp = requests.get(
+                USER_API_URL, headers=headers, timeout=15, proxies=get_proxies()
+            )
         except requests.RequestException as e:
             log(f"[{name}] [balance] network error: {e}")
             return None
@@ -992,7 +1029,9 @@ def attempt_withdraw(
         attempt_num += 1
 
         try:
-            resp = requests.post(API_URL, headers=headers, json=body, timeout=30)
+            resp = requests.post(
+                API_URL, headers=headers, json=body, timeout=30, proxies=get_proxies()
+            )
         except requests.RequestException as e:
             log(f"[{name}] [error] network error during POST: {e}")
             return EXIT_NETWORK, None, 0

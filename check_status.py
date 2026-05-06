@@ -81,7 +81,9 @@ def fetch_one(acc: dict) -> dict:
         return {"name": name, "balance": None, "status": 0, "reason": f"bad-cookie-field: {e}"}
 
     try:
-        resp = requests.get(core.USER_API_URL, headers=headers, timeout=15)
+        resp = requests.get(
+            core.USER_API_URL, headers=headers, timeout=15, proxies=core.get_proxies()
+        )
     except requests.Timeout:
         return {"name": name, "balance": None, "status": 0, "reason": "timeout (15s)"}
     except requests.RequestException as e:

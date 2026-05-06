@@ -1,0 +1,22 @@
+# Optional proxy for ALL qolvex traffic (Solana RPC stays direct).
+#
+# Copy this file to proxy.txt and fill in your DataImpulse credentials.
+# Restart the bot after editing (loaded once at process start).
+#
+# Format: one URL per line. Comments start with '#'.
+#
+# DataImpulse rotating residential SOCKS5 (recommended):
+#   socks5h://USER:PASS@gw.dataimpulse.com:823
+#
+# DataImpulse rotating residential HTTPS:
+#   http://USER:PASS@gw.dataimpulse.com:823
+#
+# Sticky session (same exit IP for 10 min instead of rotating):
+#   socks5h://USER__sid-XYZ:PASS@gw.dataimpulse.com:10000
+#
+# Country targeting (ISO code):
+#   socks5h://USER__cr.us:PASS@gw.dataimpulse.com:823
+#
+# To disable proxy, delete proxy.txt or comment out every URL line.
+
+socks5h://your_user:your_pass@gw.dataimpulse.com:823

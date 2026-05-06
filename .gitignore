@@ -9,6 +9,10 @@ x_auto.log
 pending_x.json
 x_accounts.json
 x_accounts.tsv
+proxy.txt
+balance_cache.json
+priority_test.log
+cache_cron.log
 __pycache__/
 *.pyc
 .venv/
