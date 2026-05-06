@@ -100,11 +100,15 @@ PROXY_PATH = SCRIPT_DIR / "proxy.txt"
 
 
 def _load_proxy_url() -> str | None:
-    """Read the first non-comment line of proxy.txt as the proxy URL."""
+    """Read the first non-comment line of proxy.txt as the proxy URL.
+
+    Uses utf-8-sig so a BOM (PowerShell `Out-File -Encoding utf8`, Notepad,
+    etc.) is auto-stripped instead of contaminating the URL string.
+    """
     if not PROXY_PATH.exists():
         return None
     try:
-        raw = PROXY_PATH.read_text(encoding="utf-8")
+        raw = PROXY_PATH.read_text(encoding="utf-8-sig")
     except OSError:
         return None
     for line in raw.splitlines():
