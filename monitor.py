@@ -90,7 +90,7 @@ INTER_ACCOUNT_SPACING_SEC = 5
 # from completed tasks/earns are picked up automatically.
 BALANCE_REFRESH_ENABLED = True
 BALANCE_REFRESH_INTERVAL_SEC = 120        # sweep every 2 minutes
-BALANCE_REFRESH_WORKERS = 2               # polite — avoid per-IP 429 storms
+BALANCE_REFRESH_WORKERS = 10              # safe under rotating proxy (was 2)
 BALANCE_REFRESH_FETCH_TIMEOUT_SEC = 5     # per-request timeout in the sweep
 # Anything older than this is considered stale and gets re-fetched.
 # Setting it equal to the interval = every account refreshed every cycle
