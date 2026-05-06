@@ -30,18 +30,22 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core import (
+    BALANCE_CACHE_MAX_AGE_SEC,
     EXIT_COOLDOWN,
     EXIT_OK,
     HOT_WALLET,
+    _quick_balance,
     attempt_withdraw,
     get_account_state,
     get_balance_lamports,
     invalidate_balance_cache,
     load_accounts,
+    load_balance_cache,
     load_state,
     make_logger,
     priority_sort_accounts,
     save_state,
+    update_balance_cache,
     utc_now_iso,
 )
 
@@ -79,6 +83,20 @@ PARALLEL_STAGGER_MS = 2
 
 # Sequential fallback (only used if PARALLEL_FIRE = False):
 INTER_ACCOUNT_SPACING_SEC = 5
+
+# Background balance refresh thread — keeps balance_cache.json fresh without
+# needing an external cron. Each cycle re-fetches every account whose cache
+# entry is older than BALANCE_REFRESH_FRESH_AGE_SEC, so balance increases
+# from completed tasks/earns are picked up automatically.
+BALANCE_REFRESH_ENABLED = True
+BALANCE_REFRESH_INTERVAL_SEC = 120        # sweep every 2 minutes
+BALANCE_REFRESH_WORKERS = 2               # polite — avoid per-IP 429 storms
+BALANCE_REFRESH_FETCH_TIMEOUT_SEC = 5     # per-request timeout in the sweep
+# Anything older than this is considered stale and gets re-fetched.
+# Setting it equal to the interval = every account refreshed every cycle
+# (subject to per-IP rate-limit; failed fetches don't update fetched_at,
+# so they stay "stale" and get retried automatically next cycle).
+BALANCE_REFRESH_FRESH_AGE_SEC = 120
 
 # Stop firing if hot wallet drops below this — in parallel mode this is
 # checked once before kicking off the batch; in sequential mode it's
@@ -264,6 +282,75 @@ def _process_topup(
         _process_topup_sequential(eligible, state, log)
 
 
+def _balance_refresh_loop(accounts: list[dict], log) -> None:
+    """Daemon loop: periodically refresh stale entries in balance_cache.json.
+
+    Wakes every BALANCE_REFRESH_INTERVAL_SEC, picks the subset of accounts
+    whose cache entry is missing or older than BALANCE_REFRESH_FRESH_AGE_SEC,
+    and live-fetches them with a small worker pool. Successful values are
+    written back via update_balance_cache (which already merges atomically).
+
+    Runs alongside the main poll loop — does NOT block fire timing. Exits
+    cleanly when the global _stop flag flips.
+    """
+    log(
+        f"[refresh] background thread started | interval="
+        f"{BALANCE_REFRESH_INTERVAL_SEC}s, workers={BALANCE_REFRESH_WORKERS}, "
+        f"fresh_threshold={BALANCE_REFRESH_FRESH_AGE_SEC}s"
+    )
+    # Initial small delay so we don't fight the first priority_sort fetch.
+    _sleep_with_stop(15)
+
+    while not _stop:
+        try:
+            cache = load_balance_cache()
+            now = time.time()
+            stale = [
+                a for a in accounts
+                if (
+                    a["name"] not in cache
+                    or now - float(cache[a["name"]].get("fetched_at", 0))
+                    >= BALANCE_REFRESH_FRESH_AGE_SEC
+                )
+            ]
+            if not stale:
+                _sleep_with_stop(BALANCE_REFRESH_INTERVAL_SEC)
+                continue
+
+            results: dict[str, float] = {}
+            workers = min(BALANCE_REFRESH_WORKERS, len(stale))
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="refresh"
+            ) as pool:
+                futs = {
+                    pool.submit(
+                        _quick_balance, a, BALANCE_REFRESH_FETCH_TIMEOUT_SEC
+                    ): a["name"]
+                    for a in stale
+                }
+                for fut in as_completed(futs):
+                    name = futs[fut]
+                    try:
+                        results[name] = fut.result()
+                    except Exception:  # noqa: BLE001
+                        results[name] = -1.0
+                    if _stop:
+                        break
+
+            ok = sum(1 for v in results.values() if v >= 0)
+            update_balance_cache(results)
+            log(
+                f"[refresh] swept {len(stale)} stale/missing | "
+                f"updated={ok}, failed={len(results) - ok}"
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"[refresh] cycle error (continuing): {e}")
+
+        _sleep_with_stop(BALANCE_REFRESH_INTERVAL_SEC)
+
+    log("[refresh] background thread stopped.")
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Qolvex watch-loop auto-withdraw.")
     return p.parse_args()
@@ -283,6 +370,15 @@ def main() -> int:
 
     state = load_state()
     _log_startup_status(accounts, state, log)
+
+    if BALANCE_REFRESH_ENABLED:
+        refresh_thread = threading.Thread(
+            target=_balance_refresh_loop,
+            args=(accounts, log),
+            name="balance-refresh",
+            daemon=True,
+        )
+        refresh_thread.start()
 
     last_balance = int(state.get("last_hot_balance_lamports", 0))
     last_logged_balance = last_balance
