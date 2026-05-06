@@ -92,7 +92,8 @@ BALANCE_REFRESH_ENABLED = True
 BALANCE_REFRESH_INTERVAL_SEC = 120        # sweep every 2 minutes
 BALANCE_REFRESH_WORKERS = 10              # safe under rotating proxy (was 2)
 BALANCE_REFRESH_FETCH_TIMEOUT_SEC = 10    # per-request timeout (proxy adds latency)
-BALANCE_REFRESH_RETRY_FAILED = True       # retry once within the same sweep
+BALANCE_REFRESH_MAX_RETRIES = 2           # extra passes for failed accounts (0 = none)
+BALANCE_REFRESH_RETRY_BACKOFF_SEC = 1.5   # sleep before each retry pass (lets proxy rotate)
 BALANCE_REFRESH_LOG_FAILED_NAMES = True   # log up to 5 failed account names per cycle
 # Anything older than this is considered stale and gets re-fetched.
 # Setting it equal to the interval = every account refreshed every cycle
@@ -346,17 +347,26 @@ def _balance_refresh_loop(accounts: list[dict], log) -> None:
             # Pass 1: live-fetch all stale entries.
             results = _run_pool(stale)
             recovered = 0
-            # Pass 2: retry any that failed once (covers transient proxy slow
-            # IPs / sesaat 429 / network jitter). Persistent failures (e.g.
-            # cookie expired) will still fail and surface in the log.
-            if BALANCE_REFRESH_RETRY_FAILED and not _stop:
+            # Subsequent passes: retry any still-failed accounts, with a brief
+            # sleep so DataImpulse rotates to a fresh exit IP before we hit
+            # qolvex again. This typically clears 50-70% of the residue per
+            # pass, so 2 retries pulls per-cycle failed counts close to zero.
+            # Persistent failures (e.g. expired cookie) will still surface.
+            for _ in range(BALANCE_REFRESH_MAX_RETRIES):
+                if _stop:
+                    break
                 retry_targets = [a for a in stale if results.get(a["name"], -1.0) < 0]
-                if retry_targets:
-                    retry_results = _run_pool(retry_targets)
-                    for name, val in retry_results.items():
-                        if val >= 0:
-                            recovered += 1
-                        results[name] = val
+                if not retry_targets:
+                    break
+                if BALANCE_REFRESH_RETRY_BACKOFF_SEC > 0:
+                    _sleep_with_stop(BALANCE_REFRESH_RETRY_BACKOFF_SEC)
+                    if _stop:
+                        break
+                retry_results = _run_pool(retry_targets)
+                for name, val in retry_results.items():
+                    if val >= 0 and results.get(name, -1.0) < 0:
+                        recovered += 1
+                    results[name] = val
 
             ok = sum(1 for v in results.values() if v >= 0)
             update_balance_cache(results)
