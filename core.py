@@ -699,6 +699,27 @@ def update_balance_cache(new_values: dict[str, float | None]) -> None:
     tmp.replace(BALANCE_CACHE_PATH)
 
 
+def invalidate_balance_cache(name: str) -> bool:
+    """Remove a single account's cache entry.
+
+    Used after a successful withdraw so the next priority_sort triggers a
+    fresh live-fetch instead of trusting the now-stale (likely zero) value.
+    Returns True if an entry was removed, False if it wasn't present.
+    """
+    existing = load_balance_cache()
+    if name not in existing:
+        return False
+    del existing[name]
+    payload = {"balances": existing}
+    try:
+        tmp = BALANCE_CACHE_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(BALANCE_CACHE_PATH)
+    except OSError:
+        return False
+    return True
+
+
 def priority_sort_accounts(
     accounts: list[dict],
     log: Logger,

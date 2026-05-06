@@ -36,6 +36,7 @@ from core import (
     attempt_withdraw,
     get_account_state,
     get_balance_lamports,
+    invalidate_balance_cache,
     load_accounts,
     load_state,
     make_logger,
@@ -135,6 +136,11 @@ def _record_attempt_outcome(
     entry = get_account_state(state, acc["name"])
     if exit_code == EXIT_OK:
         entry["last_success_at"] = utc_now_iso()
+        # Account just claimed its claimable balance; cache is now stale.
+        # Drop it so the next priority_sort live-fetches the real value
+        # (probably 0 until the next admin topup refills the per-account
+        # claimable amount).
+        invalidate_balance_cache(acc["name"])
         log(f"[{acc['name']}] [ok] success.")
     elif exit_code == EXIT_COOLDOWN:
         # Qolvex isn't expected to return cooldown; defensive fallback.
