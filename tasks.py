@@ -744,6 +744,14 @@ def _parse_args() -> argparse.Namespace:
             "or you want to retry one. Pair with --name to clear only that account."
         ),
     )
+    p.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help=(
+            "disable rotating SOCKS5 proxy for this run (uses VPS direct IP). "
+            "Useful for diagnosing whether qolvex's CDN/WAF is blocking proxy IPs."
+        ),
+    )
     return p.parse_args()
 
 
@@ -794,6 +802,13 @@ def main() -> int:
         accounts = match
 
     log = make_logger("tasks.log")
+
+    if args.no_proxy:
+        if core.PROXY_URL:
+            log(f"[no-proxy] disabling proxy for this run (was: {core.PROXY_URL[:40]}...).")
+            core.PROXY_URL = None
+        else:
+            log("[no-proxy] proxy was not configured; nothing to disable.")
 
     if args.reset_done:
         with _DONE_TASKS_LOCK:
