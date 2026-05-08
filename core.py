@@ -145,10 +145,11 @@ RATE_LIMIT_MAX_REQS = 3
 # ever does return a 'too many withdrawals' response.
 
 # Auto-withdraw mode: skip withdraws for accounts whose claimable balance
-# is below this. Prevents burning rate-limit budget on dust or on accounts
-# already drained in the current cycle. Adjust after checking what the
-# smallest payout typically looks like on qolvex.
-MIN_WITHDRAW_SOL = 0.0005
+# is below this. Qolvex's wallet UI explicitly states "MIN: 0.002 SOL" so
+# anything below that gets rejected server-side with "amount too small",
+# wasting a slot in the parallel-fire dispatch window. Set to 0.002 SOL
+# to match reality; raise further only if observed rejections persist.
+MIN_WITHDRAW_SOL = 0.002
 
 # Account that always fires first regardless of balance. Set to '' to
 # disable priority pinning. Used by priority_sort_accounts() below, called
