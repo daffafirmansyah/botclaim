@@ -32,6 +32,7 @@ import json
 import math
 import random
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -92,6 +93,60 @@ TASK_NETWORK_WAIT_SEC = 3             # base wait — proxy rotates between atte
 
 # Output file for tasks that need a real follow/like on X.
 PENDING_X_PATH = SCRIPT_DIR / "pending_x.json"
+
+# Local cache of (account, task_id) pairs we already completed (or that the
+# server reported as already-done). qolvex's /api/tasks response keeps listing
+# completed tasks as if they're available, so without this cache we'd burn a
+# POST + 8s sleep on every run for every old task. Atomic merge + lock makes
+# parallel-mode runs safe.
+DONE_TASKS_PATH = SCRIPT_DIR / "done_tasks.json"
+_DONE_TASKS_LOCK = threading.Lock()
+
+
+def load_done_tasks() -> dict:
+    """Return {account_name: {task_id_str: iso_ts}}; {} if missing/invalid."""
+    if not DONE_TASKS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(DONE_TASKS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def is_task_done_locally(account_name: str, task_id, cache: dict | None = None) -> bool:
+    """True if (account, task_id) is in the local done cache.
+
+    Pass `cache` to avoid re-reading the file once per task in a hot loop.
+    """
+    if not task_id:
+        return False
+    if cache is None:
+        with _DONE_TASKS_LOCK:
+            cache = load_done_tasks()
+    bucket = cache.get(account_name) or {}
+    return str(task_id) in bucket
+
+
+def mark_task_done(account_name: str, task_id) -> None:
+    """Persist (account, task_id) as done. Atomic merge under lock."""
+    if not task_id:
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _DONE_TASKS_LOCK:
+        data = load_done_tasks()
+        bucket = data.setdefault(account_name, {})
+        bucket[str(task_id)] = ts
+        tmp = DONE_TASKS_PATH.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            tmp.replace(DONE_TASKS_PATH)
+        except OSError:
+            # Don't crash a task run because we couldn't persist the cache —
+            # next run will just re-attempt and the server will say already-done.
+            pass
 
 # ----- Task-complete request body -----
 # TO-VERIFY: qolvex expects a small (~21 byte) JSON body on
@@ -485,16 +540,28 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
         empty_result["error"] = 1
         return empty_result
 
-    eligible = [t for t in tasks if _is_eligible(t)]
-    other = len(tasks) - len(eligible)
+    eligible_raw = [t for t in tasks if _is_eligible(t)]
+    other = len(tasks) - len(eligible_raw)
+
+    # Filter out tasks we've already completed (or server already rejected as
+    # done) in a previous run — qolvex's /api/tasks response doesn't flag them
+    # so we have to remember locally. Saves a POST + TASK_INTER_DELAY_SEC sleep
+    # per stale task.
+    with _DONE_TASKS_LOCK:
+        done_cache = load_done_tasks()
+    eligible = [t for t in eligible_raw if not is_task_done_locally(name, t.get("id"), done_cache)]
+    locally_done = len(eligible_raw) - len(eligible)
+
     log(
         f"[{name}] {len(tasks)} task(s) total | "
-        f"{len(eligible)} eligible (follow/like only) | "
-        f"{other} skipped (retweet/share/visit/register/already-done/etc)."
+        f"{len(eligible)} eligible (follow/like, not yet done) | "
+        f"{locally_done} skipped (cached as done) | "
+        f"{other} skipped (retweet/share/visit/register/etc)."
     )
 
     result = dict(empty_result)
     result["skipped_other"] = other
+    result["already_done"] += locally_done  # count cache hits in the summary
 
     if not eligible:
         return result
@@ -528,6 +595,7 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
             except (TypeError, ValueError):
                 pass
             log(f"[{name}] [ok] task {tid} '{title}' -> {_fmt_reward(body)}")
+            mark_task_done(name, tid)
 
         elif outcome == "need-follow":
             result["need_follow"] += 1
@@ -548,6 +616,7 @@ def process_account(acc: dict, log, dry_run: bool) -> dict:
         elif outcome == "already-done":
             result["already_done"] += 1
             log(f"[{name}] [already-done] task {tid} '{title}' (server says claimed before)")
+            mark_task_done(name, tid)
 
         elif outcome == "throttled":
             result["throttled"] += 1
@@ -634,6 +703,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="fetch + filter tasks but do NOT POST complete.",
     )
+    p.add_argument(
+        "--reset-done",
+        action="store_true",
+        help=(
+            "clear done_tasks.json before running. Use if qolvex resets a task "
+            "or you want to retry one. Pair with --name to clear only that account."
+        ),
+    )
     return p.parse_args()
 
 
@@ -684,6 +761,24 @@ def main() -> int:
         accounts = match
 
     log = make_logger("tasks.log")
+
+    if args.reset_done:
+        with _DONE_TASKS_LOCK:
+            data = load_done_tasks()
+            if args.name:
+                cleared = len(data.pop(args.name, {}) or {})
+                log(f"[reset-done] cleared {cleared} entries for account {args.name!r}.")
+            else:
+                cleared = sum(len(v or {}) for v in data.values())
+                data = {}
+                log(f"[reset-done] cleared {cleared} entries across all accounts.")
+            try:
+                DONE_TASKS_PATH.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+            except OSError as e:
+                log(f"[reset-done] FAILED to persist cleared cache: {e}")
+
     log(
         f"tasks one-shot start | accounts={[a['name'] for a in accounts]} "
         f"mode={'parallel' if args.parallel else 'sequential'} "

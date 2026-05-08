@@ -11,6 +11,7 @@ x_accounts.json
 x_accounts.tsv
 proxy.txt
 balance_cache.json
+done_tasks.json
 priority_test.log
 cache_cron.log
 __pycache__/
