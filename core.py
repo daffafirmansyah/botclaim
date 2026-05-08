@@ -672,41 +672,51 @@ def _try_parse_json(resp: requests.Response) -> dict | None:
     return {"raw": parsed}
 
 
-def _quick_balance(acc: dict, timeout: float = 3.0) -> float:
-    """One-shot balance fetch, NO retries. Returns -1.0 on any failure.
+def _quick_balance(acc: dict, timeout: float = 3.0, retries: int = 0) -> float:
+    """Balance fetch returning -1.0 on failure.
 
-    Used only by priority_sort_accounts() pre-fire — we want fast sort,
-    not perfect data. Accounts that 429/timeout sort to the end and fire
-    last; they still fire and the infinite-retry policy in attempt_withdraw
-    will eventually succeed for them.
+    retries=0 (default) → 1 attempt, no internal retry. Used by
+        priority_sort_accounts() pre-fire — we want fast sort, not perfect
+        data. Accounts that 429/timeout sort to the end and fire last; the
+        infinite-retry policy in attempt_withdraw still wins them.
+    retries=N        → up to N+1 attempts with brief backoff between, so the
+        proxy can rotate to a fresh exit IP. Used by the background refresh
+        thread, where a fully-populated cache is more important than speed.
     """
-    try:
-        headers = build_headers(acc["cookie"], referer_path="/dashboard")
-        resp = requests.get(
-            USER_API_URL, headers=headers, timeout=timeout, proxies=get_proxies()
-        )
-    except Exception:  # noqa: BLE001
+    headers = build_headers(acc["cookie"], referer_path="/dashboard")
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            # Brief jittered sleep so DataImpulse hands us a different exit
+            # IP for the retry. Keep small so cycle budget stays modest.
+            time.sleep(0.4 + random.uniform(0, 0.4))
+        try:
+            resp = requests.get(
+                USER_API_URL, headers=headers, timeout=timeout, proxies=get_proxies()
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if resp.status_code != 200:
+            continue
+        try:
+            parsed = resp.json()
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for field in (
+            "currentBalance", "balanceSolTask", "balanceSol",
+            "balance", "claimable", "claimableSol",
+        ):
+            v = parsed.get(field)
+            if isinstance(v, (int, float)):
+                return float(v)
+            for sub in parsed.values():
+                if isinstance(sub, dict) and field in sub:
+                    vv = sub[field]
+                    if isinstance(vv, (int, float)):
+                        return float(vv)
+        # Parsed OK but no recognized balance field — won't help to retry.
         return -1.0
-    if resp.status_code != 200:
-        return -1.0
-    try:
-        parsed = resp.json()
-    except Exception:  # noqa: BLE001
-        return -1.0
-    if not isinstance(parsed, dict):
-        return -1.0
-    for field in (
-        "currentBalance", "balanceSolTask", "balanceSol",
-        "balance", "claimable", "claimableSol",
-    ):
-        v = parsed.get(field)
-        if isinstance(v, (int, float)):
-            return float(v)
-        for sub in parsed.values():
-            if isinstance(sub, dict) and field in sub:
-                vv = sub[field]
-                if isinstance(vv, (int, float)):
-                    return float(vv)
     return -1.0
 
 

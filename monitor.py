@@ -92,8 +92,16 @@ BALANCE_REFRESH_ENABLED = True
 BALANCE_REFRESH_INTERVAL_SEC = 120        # sweep every 2 minutes
 BALANCE_REFRESH_WORKERS = 10              # safe under rotating proxy (was 2)
 BALANCE_REFRESH_FETCH_TIMEOUT_SEC = 10    # per-request timeout (proxy adds latency)
-BALANCE_REFRESH_MAX_RETRIES = 2           # extra passes for failed accounts (0 = none)
-BALANCE_REFRESH_RETRY_BACKOFF_SEC = 1.5   # sleep before each retry pass (lets proxy rotate)
+# Three-layer retry to push failed≈0 every cycle:
+#   inner: BALANCE_REFRESH_INNER_RETRIES retries inside each _quick_balance
+#          call (different exit IP per attempt, ~0.5s gap)
+#   outer: BALANCE_REFRESH_MAX_RETRIES extra full passes after pass 1
+#   sleep: BALANCE_REFRESH_RETRY_BACKOFF_SEC between outer passes
+# Budget: ~10s sweep × (1+3) passes + 3×2.5s = ~50s, fits 120s interval.
+# Per-attempt success ~95%, total attempts up to 2×(1+3)=8 → 1-0.05^8 ≈ 99.99999%.
+BALANCE_REFRESH_INNER_RETRIES = 1         # 2 attempts per _quick_balance call
+BALANCE_REFRESH_MAX_RETRIES = 3           # extra passes for still-failed accounts
+BALANCE_REFRESH_RETRY_BACKOFF_SEC = 2.5   # sleep before each retry pass (lets proxy rotate)
 BALANCE_REFRESH_LOG_FAILED_NAMES = True   # log up to 5 failed account names per cycle
 # Anything older than this is considered stale and gets re-fetched.
 # Setting it equal to the interval = every account refreshed every cycle
@@ -330,7 +338,10 @@ def _balance_refresh_loop(accounts: list[dict], log) -> None:
                 ) as pool:
                     futs = {
                         pool.submit(
-                            _quick_balance, a, BALANCE_REFRESH_FETCH_TIMEOUT_SEC
+                            _quick_balance,
+                            a,
+                            BALANCE_REFRESH_FETCH_TIMEOUT_SEC,
+                            BALANCE_REFRESH_INNER_RETRIES,
                         ): a["name"]
                         for a in targets
                     }
