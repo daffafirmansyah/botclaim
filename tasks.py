@@ -80,8 +80,12 @@ PARALLEL_STAGGER_MS = 2
 # with sub-second jitter so 100 parallel workers don't all retry on the
 # exact same tick. The only thing that stops a retry loop is a non-429
 # non-5xx response (success, 4xx other than 429, or network error).
-TASK_429_MAX_RETRIES = math.inf       # infinite retries on 429
-TASK_5XX_MAX_RETRIES = math.inf       # infinite retries on 5xx (qolvex outage)
+TASK_429_MAX_RETRIES = math.inf       # infinite retries on 429 (per-cookie bucket refills)
+# 5xx: bounded. Qolvex sometimes returns 503 forever on a specific task whose
+# X target was banned / verification webhook broke. Looping infinite there
+# would block every other account in the run. 15 attempts ~ 40s before we
+# give up on this task and let the next account proceed.
+TASK_5XX_MAX_RETRIES = 15
 TASK_429_WAIT_SEC = 2                 # base wait between retries
 TASK_429_WAIT_MAX_SEC = 5             # cap on server Retry-After (ignore absurd values)
 TASK_RETRY_JITTER_SEC = 1             # 0..1s jitter on top of base wait
@@ -381,11 +385,14 @@ def _compute_429_wait(resp: requests.Response) -> float:
 
 def fetch_tasks(cookie: str, log=None, label: str = "") -> list[dict]:
     """GET /api/tasks for one account, snipe-mode retry on 429 / 5xx.
-    Loops forever on transient failures (429 or 5xx); retries network/SSL
-    errors up to TASK_NETWORK_MAX_RETRIES (proxy IP rotation usually fixes
-    them); raises on non-transient 4xx (e.g. 401 expired cookie)."""
+    429 retries forever (per-cookie bucket eventually refills). 5xx retries
+    are capped at TASK_5XX_MAX_RETRIES — a persistent 503 means qolvex's
+    backend is broken for this endpoint; better to surface the error than
+    block every other account. Network/SSL errors retried up to
+    TASK_NETWORK_MAX_RETRIES."""
     resp = None
     attempt = 0
+    server_retries = 0
     network_retries = 0
     while True:
         try:
@@ -419,16 +426,27 @@ def fetch_tasks(cookie: str, log=None, label: str = "") -> list[dict]:
             time.sleep(wait)
             attempt += 1
             continue
-        # 5xx server outage — keep retrying forever
+        # 5xx server error — bounded retry. After TASK_5XX_MAX_RETRIES we let
+        # the response fall through and raise_for_status() will surface it,
+        # so the caller can move on instead of looping forever.
         if 500 <= resp.status_code < 600:
+            if server_retries >= TASK_5XX_MAX_RETRIES:
+                if log:
+                    log(
+                        f"{label} [give-up] {resp.status_code} on /api/tasks "
+                        f"after {server_retries + 1} attempts; surfacing error."
+                    )
+                break
             wait = TASK_429_WAIT_SEC + random.uniform(0, TASK_RETRY_JITTER_SEC)
             if log:
                 log(
                     f"{label} [retry] {resp.status_code} on /api/tasks; "
-                    f"sleep {wait:.1f}s then retry (attempt {attempt + 2}, snipe-mode)."
+                    f"sleep {wait:.1f}s then retry "
+                    f"(attempt {server_retries + 2}/{TASK_5XX_MAX_RETRIES + 1})."
                 )
             time.sleep(wait)
             attempt += 1
+            server_retries += 1
             continue
         break
 
@@ -447,11 +465,15 @@ def fetch_tasks(cookie: str, log=None, label: str = "") -> list[dict]:
 def complete_task(
     cookie: str, task_id: int | str, log=None, label: str = ""
 ) -> tuple[int, dict | None]:
-    """POST /api/tasks/{id}/complete with TASK_COMPLETE_BODY, snipe-mode
-    retry on 429 / 5xx (loop forever on transient). Network/SSL errors
-    retried up to TASK_NETWORK_MAX_RETRIES (proxy rotates between attempts)."""
+    """POST /api/tasks/{id}/complete with TASK_COMPLETE_BODY.
+    429 retries forever (per-cookie bucket refills). 5xx retries capped at
+    TASK_5XX_MAX_RETRIES — persistent 503 on a specific task usually means
+    qolvex's verification webhook is broken for that task (e.g. target X
+    account banned), so we give up and let process_account move on. Network/
+    SSL errors retried up to TASK_NETWORK_MAX_RETRIES."""
     resp = None
     attempt = 0
+    server_retries = 0
     network_retries = 0
     while True:
         try:
@@ -486,17 +508,28 @@ def complete_task(
             time.sleep(wait)
             attempt += 1
             continue
-        # 5xx server outage — keep retrying forever
+        # 5xx server error — bounded retry. After TASK_5XX_MAX_RETRIES we
+        # break out and return the last 5xx response. process_account will
+        # classify it as 'error' and move on to the next task.
         if 500 <= resp.status_code < 600:
+            if server_retries >= TASK_5XX_MAX_RETRIES:
+                if log:
+                    log(
+                        f"{label} [give-up] {resp.status_code} on task {task_id} "
+                        f"complete after {server_retries + 1} attempts; "
+                        f"surfacing error and moving on."
+                    )
+                break
             wait = TASK_429_WAIT_SEC + random.uniform(0, TASK_RETRY_JITTER_SEC)
             if log:
                 log(
                     f"{label} [retry] {resp.status_code} on task {task_id} "
                     f"complete; sleep {wait:.1f}s then retry "
-                    f"(attempt {attempt + 2}, snipe-mode)."
+                    f"(attempt {server_retries + 2}/{TASK_5XX_MAX_RETRIES + 1})."
                 )
             time.sleep(wait)
             attempt += 1
+            server_retries += 1
             continue
         break
 
