@@ -84,6 +84,11 @@ TASK_5XX_MAX_RETRIES = math.inf       # infinite retries on 5xx (qolvex outage)
 TASK_429_WAIT_SEC = 2                 # base wait between retries
 TASK_429_WAIT_MAX_SEC = 5             # cap on server Retry-After (ignore absurd values)
 TASK_RETRY_JITTER_SEC = 1             # 0..1s jitter on top of base wait
+# Network/SSL errors via SOCKS5 proxy: usually transient (bad exit IP). Retry
+# with backoff long enough for DataImpulse to rotate IP. Bounded so a truly
+# dead network surfaces as an error instead of looping forever.
+TASK_NETWORK_MAX_RETRIES = 5
+TASK_NETWORK_WAIT_SEC = 3             # base wait — proxy rotates between attempts
 
 # Output file for tasks that need a real follow/like on X.
 PENDING_X_PATH = SCRIPT_DIR / "pending_x.json"
@@ -321,17 +326,33 @@ def _compute_429_wait(resp: requests.Response) -> float:
 
 def fetch_tasks(cookie: str, log=None, label: str = "") -> list[dict]:
     """GET /api/tasks for one account, snipe-mode retry on 429 / 5xx.
-    Loops forever on transient failures (429 or 5xx); raises on network
-    error or non-transient 4xx (e.g. 401 expired cookie)."""
+    Loops forever on transient failures (429 or 5xx); retries network/SSL
+    errors up to TASK_NETWORK_MAX_RETRIES (proxy IP rotation usually fixes
+    them); raises on non-transient 4xx (e.g. 401 expired cookie)."""
     resp = None
     attempt = 0
+    network_retries = 0
     while True:
-        resp = requests.get(
-            TASKS_LIST_URL,
-            headers=_tasks_list_headers(cookie),
-            timeout=HTTP_TIMEOUT_SEC,
-            proxies=core.get_proxies(),
-        )
+        try:
+            resp = requests.get(
+                TASKS_LIST_URL,
+                headers=_tasks_list_headers(cookie),
+                timeout=HTTP_TIMEOUT_SEC,
+                proxies=core.get_proxies(),
+            )
+        except requests.RequestException as e:
+            if network_retries >= TASK_NETWORK_MAX_RETRIES:
+                raise
+            wait = TASK_NETWORK_WAIT_SEC + random.uniform(0, TASK_RETRY_JITTER_SEC)
+            if log:
+                log(
+                    f"{label} [retry] network error on /api/tasks ({type(e).__name__}); "
+                    f"sleep {wait:.1f}s for proxy rotation "
+                    f"(attempt {network_retries + 2}/{TASK_NETWORK_MAX_RETRIES + 1})."
+                )
+            time.sleep(wait)
+            network_retries += 1
+            continue
         # 429 — keep retrying forever
         if resp.status_code == 429:
             wait = _compute_429_wait(resp)
@@ -372,9 +393,11 @@ def complete_task(
     cookie: str, task_id: int | str, log=None, label: str = ""
 ) -> tuple[int, dict | None]:
     """POST /api/tasks/{id}/complete with TASK_COMPLETE_BODY, snipe-mode
-    retry on 429 / 5xx (loop forever on transient)."""
+    retry on 429 / 5xx (loop forever on transient). Network/SSL errors
+    retried up to TASK_NETWORK_MAX_RETRIES (proxy rotates between attempts)."""
     resp = None
     attempt = 0
+    network_retries = 0
     while True:
         try:
             resp = requests.post(
@@ -385,7 +408,18 @@ def complete_task(
                 proxies=core.get_proxies(),
             )
         except requests.RequestException as e:
-            return 0, {"error": f"network: {e}"}
+            if network_retries >= TASK_NETWORK_MAX_RETRIES:
+                return 0, {"error": f"network: {e}"}
+            wait = TASK_NETWORK_WAIT_SEC + random.uniform(0, TASK_RETRY_JITTER_SEC)
+            if log:
+                log(
+                    f"{label} [retry] network error on task {task_id} complete "
+                    f"({type(e).__name__}); sleep {wait:.1f}s for proxy rotation "
+                    f"(attempt {network_retries + 2}/{TASK_NETWORK_MAX_RETRIES + 1})."
+                )
+            time.sleep(wait)
+            network_retries += 1
+            continue
         # 429 — keep retrying forever
         if resp.status_code == 429:
             wait = _compute_429_wait(resp)

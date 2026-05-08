@@ -182,6 +182,15 @@ BALANCE_FETCH_429_MAX_RETRIES = 3
 BALANCE_FETCH_429_WAIT_SEC = 10
 BALANCE_FETCH_429_WAIT_MAX_SEC = 60
 
+# Network/SSL errors via SOCKS5 proxy: usually transient (bad exit IP). Retry
+# bounded with backoff so DataImpulse rotates between attempts. Withdraw is
+# critical (don't lose money to flaky proxy IP), so its retry budget is
+# generous; balance fetch is informational and gets fewer.
+WITHDRAW_NETWORK_MAX_RETRIES = 8       # 9 total attempts; covers most rotation cycles
+WITHDRAW_NETWORK_WAIT_SEC = 2          # base wait — fast, proxy rotates quickly
+BALANCE_NETWORK_MAX_RETRIES = 3
+BALANCE_NETWORK_WAIT_SEC = 2
+
 # Qolvex returns 429 with Content-Type: text/plain and body "Too many requests"
 # (17 bytes). These substrings let us detect the daily-cooldown message that
 # sometimes comes back as 200-OK in a JSON body. Tune if qolvex phrases it
@@ -873,12 +882,25 @@ def fetch_claimable_balance(cfg: dict, log: Logger) -> float | None:
     headers = build_headers(cfg["cookie"], referer_path="/dashboard")
 
     resp = None
+    network_retries_left = BALANCE_NETWORK_MAX_RETRIES
     for attempt in range(BALANCE_FETCH_429_MAX_RETRIES + 1):
         try:
             resp = requests.get(
                 USER_API_URL, headers=headers, timeout=15, proxies=get_proxies()
             )
         except requests.RequestException as e:
+            # SOCKS5 hiccups (SSL WRONG_VERSION_NUMBER, conn reset, etc.) — try
+            # again once or twice while the proxy rotates to a new IP.
+            if network_retries_left > 0:
+                wait = BALANCE_NETWORK_WAIT_SEC + random.uniform(0, RETRY_JITTER_SEC)
+                network_retries_left -= 1
+                log(
+                    f"[{name}] [balance] network error ({type(e).__name__}); "
+                    f"sleep {wait:.1f}s and retry "
+                    f"({network_retries_left} network retries left)."
+                )
+                time.sleep(wait)
+                continue
             log(f"[{name}] [balance] network error: {e}")
             return None
         if resp.status_code != 429 or attempt == BALANCE_FETCH_429_MAX_RETRIES:
@@ -1027,6 +1049,7 @@ def attempt_withdraw(
     rate_limit_retries_left = MAX_RETRIES_RATE_LIMIT
     server_error_retries_left = MAX_RETRIES_SERVER_ERROR
     outage_retries_left = OUTAGE_MAX_RETRIES
+    network_retries_left = WITHDRAW_NETWORK_MAX_RETRIES
     attempt_num = 0
 
     while True:
@@ -1037,7 +1060,21 @@ def attempt_withdraw(
                 API_URL, headers=headers, json=body, timeout=30, proxies=get_proxies()
             )
         except requests.RequestException as e:
-            log(f"[{name}] [error] network error during POST: {e}")
+            # Almost always a transient SOCKS5 / SSL hiccup from a flaky
+            # DataImpulse exit IP. Wait briefly for the proxy to rotate and
+            # try again; only give up after WITHDRAW_NETWORK_MAX_RETRIES.
+            if network_retries_left > 0:
+                wait = WITHDRAW_NETWORK_WAIT_SEC + random.uniform(0, RETRY_JITTER_SEC)
+                network_retries_left -= 1
+                log(
+                    f"[{name}] [retry] network error ({type(e).__name__}: {e}); "
+                    f"sleeping {wait:.1f}s for proxy rotation "
+                    f"(attempt {attempt_num + 1}, "
+                    f"{network_retries_left} network retries left)."
+                )
+                time.sleep(wait)
+                continue
+            log(f"[{name}] [error] network error during POST (retries exhausted): {e}")
             return EXIT_NETWORK, None, 0
 
         status = resp.status_code
