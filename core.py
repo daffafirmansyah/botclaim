@@ -166,15 +166,25 @@ AUTO_WITHDRAW_BUFFER_SOL = 0.000001
 
 # ----- Retry policy for transient failures -----
 # AGGRESSIVE / SNIPE mode: retry 429 and 5xx as fast as possible.
-# 24h daily cooldown (server-enforced lock) is NEVER retried — retrying
-# just burns rate-limit budget that could snipe other eligible accounts.
+# Qolvex has NO daily cooldown documented in its T&C — every 429 is a
+# transient per-IP/per-cookie rate-limit, NOT a server-enforced lock.
+# So 429 always retries regardless of Retry-After value.
 MAX_RETRIES_RATE_LIMIT = math.inf      # infinite retries on 429
 MAX_RETRIES_SERVER_ERROR = math.inf    # infinite retries on 5xx
 RETRY_429_FALLBACK_SEC = 2             # used when server omits Retry-After
 RETRY_429_MAX_WAIT_SEC = 2             # cap on actual wait — overrides server
-RETRY_429_COOLDOWN_THRESHOLD_SEC = 3600  # Retry-After > 1h => treat as lock
+RETRY_429_COOLDOWN_THRESHOLD_SEC = math.inf  # qolvex has no daily lock; never treat as cooldown
 SERVER_ERROR_BACKOFF_SEC = (2, 2, 2, 2)  # flat 2s wait, no escalation
 RETRY_JITTER_SEC = 1                     # small jitter to desync workers
+
+# WAF / Cloudflare 403 retry. When 100 accounts fire in a 200ms window,
+# Cloudflare may briefly flag the burst from a single proxy exit IP.
+# SOCKS5 rotation surfaces a fresh IP between retries, so most 403s
+# clear within 1-2 attempts. Limit retries so a real WAF ban doesn't
+# trap the worker forever — surface as EXIT_API_ERROR after exhaustion.
+WAF_BLOCK_MAX_RETRIES = 5              # 6 total attempts
+WAF_BLOCK_WAIT_SEC = 5                 # base wait — longer than 429 to let WAF cool off
+WAF_BLOCK_WAIT_MAX_SEC = 30            # cap on backoff
 
 # 429 retry for GET /api/stats/dashboard (balance fetch, not time-critical).
 # More patient than the withdraw POST retry — we'd rather wait for the
@@ -1061,6 +1071,7 @@ def attempt_withdraw(
     server_error_retries_left = MAX_RETRIES_SERVER_ERROR
     outage_retries_left = OUTAGE_MAX_RETRIES
     network_retries_left = WITHDRAW_NETWORK_MAX_RETRIES
+    waf_retries_left = WAF_BLOCK_MAX_RETRIES
     attempt_num = 0
 
     while True:
@@ -1130,6 +1141,40 @@ def attempt_withdraw(
 
             log(f"[{name}] [cooldown] 429 retries exhausted; giving up.")
             return EXIT_COOLDOWN, parsed, status
+
+        # ----- 401: cookie expired / unauthorized — NO retry, fatal -----
+        # No amount of retrying will rescue an invalid cookie; surface
+        # immediately so the operator knows which account to re-login.
+        if status == 401:
+            log(
+                f"[{name}] [error] 401 unauthorized — cookie likely expired. "
+                f"Refresh cookie in config.json for this account."
+            )
+            return EXIT_API_ERROR, parsed, status
+
+        # ----- 403: WAF / Cloudflare block — retry with longer backoff -----
+        # When 100 accounts fire in a 200ms window, Cloudflare can briefly
+        # flag the burst from a single proxy exit IP. SOCKS5 rotation
+        # surfaces a fresh IP between retries, so most 403s clear within
+        # 1-2 attempts. Bounded retry so a real WAF ban doesn't trap us.
+        if status == 403:
+            if waf_retries_left > 0:
+                wait = WAF_BLOCK_WAIT_SEC + random.uniform(0, RETRY_JITTER_SEC)
+                wait = min(wait, WAF_BLOCK_WAIT_MAX_SEC)
+                waf_retries_left -= 1
+                log(
+                    f"[{name}] [retry] 403 WAF/Cloudflare block; sleeping "
+                    f"{wait:.1f}s for proxy IP rotation "
+                    f"(attempt {attempt_num + 1}, "
+                    f"{waf_retries_left} WAF retries left)."
+                )
+                time.sleep(wait)
+                continue
+            log(
+                f"[{name}] [error] 403 WAF block; retries exhausted. "
+                f"Likely sustained ban — check proxy / headers."
+            )
+            return EXIT_API_ERROR, parsed, status
 
         # ----- 200-ish + cooldown message: 24h daily cooldown, NO retry -----
         if is_cooldown_message(parsed):
