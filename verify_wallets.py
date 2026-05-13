@@ -18,11 +18,12 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import re
 import sys
 from collections import Counter
 from pathlib import Path
+
+import core
 
 BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
@@ -40,8 +41,14 @@ def _load_canonical_wallets() -> list[str]:
 
 
 def main() -> int:
-    cfg = json.loads(Path("config.json").read_text(encoding="utf-8-sig"))
-    accounts = cfg.get("accounts", []) if isinstance(cfg, dict) else cfg
+    # core.load_accounts() sanitizes embedded CR/LF/TAB in cookie strings
+    # that would otherwise break raw json.loads(). Mirror what monitor.py
+    # and withdraw.py actually see at runtime.
+    try:
+        accounts = core.load_accounts()
+    except (OSError, ValueError, RuntimeError) as e:
+        print(f"[error] core.load_accounts() failed: {e}", file=sys.stderr)
+        return 1
     if not accounts:
         print("[error] no accounts in config.json", file=sys.stderr)
         return 1
